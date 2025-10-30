@@ -9,6 +9,7 @@ from .ImageBind import data
 from .common.modeling_llama import LlamaForCausalLM
 from transformers import StoppingCriteria, StoppingCriteriaList
 from .common.utils import *
+import glob
 # from speech_generator.generate_audio import StyleTTS2
 # from talking_face_generator.generate_video import generate_video
 
@@ -145,8 +146,13 @@ class MERGModel(nn.Module):
         for i in range(len(dia_ids)):
             video_paths = []
             for utt_id in range(max_utt_ids[i]):
-                video_path = self.args['video_path'] + f'/dia{dia_ids[i]}utt{utt_id+1}.mp4'
-                video_paths.append(video_path)
+                dia_str = str(dia_ids[i]).zfill(5)
+                pattern = os.path.join(self.args['video_path'], f'dia{dia_str}utt{utt_id + 1}_[0-9]*.mp4')
+                video_pathes = glob.glob(pattern)
+                if not video_pathes:
+                    raise FileNotFoundError(f"No audio file found for pattern: {pattern}")
+                video_paths.append(video_pathes[0])
+
             inputs = {ModalityType.VISION: data.load_and_transform_video_data(video_paths, self.device)}
                 # convert into visual dtype
             inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}
@@ -171,8 +177,12 @@ class MERGModel(nn.Module):
         for i in range(len(dia_ids)):
             audio_paths = []
             for utt_id in range(max_utt_ids[i]):
-                audio_path = self.args['audio_path'] + f'/dia{dia_ids[i]}utt{utt_id+1}.wav'
-                audio_paths.append(audio_path)
+                dia_str = str(dia_ids[i]).zfill(5)
+                pattern = os.path.join(self.args['audio_path'], f'dia{dia_str}utt{utt_id + 1}_[0-9]*.wav')
+                audio_pathes = glob.glob(pattern)
+                if not audio_pathes:
+                    raise FileNotFoundError(f"No audio file found for pattern: {pattern}")
+                audio_paths.append(audio_pathes[0])
             inputs = {ModalityType.AUDIO: data.load_and_transform_audio_data(audio_paths, self.device)}
             # convert into visual dtype
             inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}

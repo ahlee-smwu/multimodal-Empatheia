@@ -13,6 +13,7 @@
     "allgather_bucket_size": 500000000,
     "allgather_partitions": true
   },
+  "zero_force_ds_cpu_optimizer": false,
   "fp16": {
     "enabled": true,
     "opt_level": "O2",
