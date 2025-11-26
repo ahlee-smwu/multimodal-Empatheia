@@ -11,7 +11,8 @@ def load_dataset(args):
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
     if args['mode'] == 'train':
-        batch_size = args['world_size'] * args['dschf'].config['train_micro_batch_size_per_gpu']
+        # batch_size = args['world_size'] * args['dschf'].config['train_micro_batch_size_per_gpu']
+        batch_size = 1 #!!!!!!!!!!!!!!!!!! just for test, delete it for train
     elif args['mode'] == 'test':
         batch_size = 1
     else:
@@ -24,6 +25,7 @@ def load_dataset(args):
                                                 rank=rank,
                                                 world_size=world_size,
                                             )
+    '''original iter'''
     iter_ = DataLoader(
         _dataset,
         batch_sampler=batch_sampler,
@@ -31,5 +33,12 @@ def load_dataset(args):
         collate_fn=_dataset.collate_fn,
         pin_memory=True
     )
-    return _dataset, iter_, sampler
-
+    # iter_ = DataLoader(
+    #     _dataset,
+    #     batch_size=args.get('batch_size', 1),
+    #     shuffle=True if args['mode'] == 'train' else False,
+    #     collate_fn=_dataset.collate_fn,
+    #     num_workers=1,
+    #     pin_memory=True
+    # )
+    return _dataset, iter_, None

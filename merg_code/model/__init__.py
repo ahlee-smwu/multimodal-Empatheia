@@ -2,6 +2,7 @@ import os.path
 from collections import OrderedDict
 
 from .agent import DeepSpeedAgent
+from .agent import AccelerateAgent
 from .merg import MERGModel
 import torch
 

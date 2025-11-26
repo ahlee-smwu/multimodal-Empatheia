@@ -3,8 +3,8 @@ from dataset import load_dataset
 from model import *
 from config import load_config
 
-os.environ['RANK'] = '0'
-os.environ['WORLD_SIZE'] = '1'
+# os.environ['RANK'] = '0'
+# os.environ['WORLD_SIZE'] = '1'
 
 def parser_args():
     parser = argparse.ArgumentParser(description='train parameters')
@@ -13,8 +13,8 @@ def parser_args():
     parser.add_argument('--audio_path', type=str, default="/mnt/dataset/AvaMERG_jhchoi/AvaMERG/audio_v5_0")
     parser.add_argument('--video_path', type=str, default="/mnt/dataset/AvaMERG_jhchoi/AvaMERG/video_v5_0")
     parser.add_argument('--local_rank', default=0, type=int)
-    parser.add_argument('--save_path', type=str, default='ckpt/merg_ckpt/')
-    parser.add_argument('--log_path', type=str, default='ckpt/merg_ckpt/')
+    parser.add_argument('--save_path', type=str, default='ckpt/merg_ckpt2/')
+    parser.add_argument('--log_path', type=str, default='ckpt/merg_ckpt2/')
     parser.add_argument('--assets_path', type=str, default='./assets/')
     parser.add_argument('--max_length', type=int, default=1024)  
 
@@ -90,6 +90,8 @@ def main(**args):
                 pbar=pbar
             )
             current_step += 1
+            if current_step in (3, 10000):
+                agent.save_model(args['save_path'], current_step, current_step)
         torch.distributed.barrier()
         agent.save_model(args['save_path'], epoch_i+1, current_step)
     
