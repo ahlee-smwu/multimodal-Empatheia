@@ -441,6 +441,92 @@ class MERGModel(nn.Module):
             'loss_sal': L_sal.detach(),
             'loss_cls': L_cls.detach()
         }
+
+    def return_generate(self, inputs):
+        gen_acc = 0
+
+        input_ids, target_ids, attention_mask = process_batch_text_stream(self.llama_tokenizer,
+                                                                          inputs['conversations'],
+                                                                          self.max_length
+                                                                          )
+
+        input_ids = input_ids.to(self.device)
+        target_ids = target_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+
+        return input_ids, attention_mask
+
+
+        inputs_audio_embs, audio_llama_atts = self.encode_audio(inputs)
+        inputs_video_embs, video_llama_atts = self.encode_video(inputs)
+        inputs_embeds, target_ids, attention_mask = self.prompt_wrap(
+            inputs_audio_embs,
+            inputs_video_embs,
+            input_ids,
+            target_ids,
+            attention_mask
+        )
+
+        return inputs_embeds, attention_mask
+
+    @torch.no_grad()
+    def generate_response(
+            self,
+            inputs,
+            max_new_tokens=128,
+            temperature=0.8,
+            top_p=0.95,
+            do_sample=True
+    ):
+        """
+        멀티모달 입력 또는 텍스트-only 입력을 받아 실제 생성결과(문장)를 리턴.
+        """
+        self.eval()
+        # ----- (1) 텍스트 tokenize (풀 문장 입력)
+        input_ids, _, attention_mask = process_batch_text_stream(
+            self.llama_tokenizer,
+            inputs['conversations'],
+            self.max_length
+        )
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+
+        # ----- (2) 멀티모달 임베딩 추출 (오디오/비디오 있을 때만)
+        if 'use_multimodal' in inputs and inputs['use_multimodal']:
+            inputs_audio_embs, audio_llama_atts = self.encode_audio(inputs)
+            inputs_video_embs, video_llama_atts = self.encode_video(inputs)
+        else:
+            inputs_audio_embs = None
+            inputs_video_embs = None
+
+        # ----- (3) 입력 임베딩 조립
+        if (inputs_audio_embs is not None and inputs_video_embs is not None
+                and len(inputs_audio_embs) > 0 and len(inputs_video_embs) > 0):
+            # 멀티모달
+            inputs_embeds, _, attention_mask = self.prompt_wrap(
+                inputs_audio_embs,
+                inputs_video_embs,
+                input_ids,
+                torch.zeros_like(input_ids),  # 추론엔 타깃 필요 없음
+                attention_mask
+            )
+            # llama의 generate는 inputs_embeds로 직접 생성 불가 → 아래에서 token-by-token 방식 구현 필요 (커스텀)
+            # 또는 text-only로 강제할 땐 input_ids/attention_mask만 전달 (아래 참고)
+            # 실제로는 멀티모달임베딩을 받는 커스텀 generate 구현 필요
+            return "멀티모달 추론 커스텀 generate 함수 별도 필요 (inputs_embeds 활용)"
+        else:
+            # 텍스트-only 추론
+            generated_ids = self.llama_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=do_sample
+            )
+            output_text = self.llama_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            return output_text
+
     
 
     

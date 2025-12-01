@@ -1,31 +1,31 @@
 models:
   merg:
     model_name: MERGModel
-    agent_name: DeepSpeedAgent
-seed: 13
-max_length: 512
-max_response_length: 512
-logging_step: 50
-vicuna_version: 7b_v0
-pretrained_ckpt_path: ckpt/pretrained_ckpt/
-data_path: merg_data
-freeze_lm: false
-freeze_input_proj: false
-warmup_rate: 0.1
-epochs: 6
-max_shard_size: 10GB
-alpha: 0.3
-beta: 0.3
-kld_weight: 0.0001
-styletts2_ckpt_dir: ckpt/styletts2_encoders
-dreamtalk_ckpt_dir: ckpt/dreamtalk_encoders
-lora_r: 8
-lora_alpha: 32
-lora_dropout: 0.1
-imagebind_version: huge
-num_vid_tokens: 24
-num_aud_tokens: 24
-num_gen_aud_tokens: 16
-num_gen_vid_tokens: 16
-log_path: ./logs/
-save_path: ckpt/merg_ckpt/
+    agent_name: DeepSpeedAgent #AccelerateAgent
+  seed: 13
+  max_length: 512
+  max_response_length: 512
+  logging_step: 50
+  vicuna_version: 7b_v0
+  pretrained_ckpt_path: ckpt/pretrained_ckpt/
+  data_path: merg_data
+  freeze_lm: false
+  freeze_input_proj: false
+  warmup_rate: 0.1
+  epochs: 6
+  max_shard_size: 10GB
+  alpha: 0.3
+  beta: 0.3
+  kld_weight: 0.0001
+  styletts2_ckpt_dir: ckpt/styletts2_encoders
+  dreamtalk_ckpt_dir: ckpt/dreamtalk_encoders
+  lora_r: 8
+  lora_alpha: 32
+  lora_dropout: 0.1
+  imagebind_version: huge
+  num_vid_tokens: 24
+  num_aud_tokens: 24
+  num_gen_aud_tokens: 16
+  num_gen_vid_tokens: 16
+  log_path: ./logs/
+  save_path: ckpt/merg_ckpt/

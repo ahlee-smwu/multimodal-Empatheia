@@ -7,3 +7,5 @@ ckpt/*
 !ckpt/
 logs/*
 !logs/
+__pycache__/
+*.pyc

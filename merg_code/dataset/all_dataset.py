@@ -163,20 +163,30 @@ class multimodal_empathetic_dialogue(Dataset):
         self.data = []
         with open(os.path.join(args['data_path'], args['mode']+'.json'), 'r', encoding='utf-8') as f:
             self.raw_data = json.load(f)
-    
-        for item in tqdm(self.raw_data, total=len(self.raw_data)):
-            turn = item['turns'][-1]
-            conversation_id = item['conversation_id']
-            speaker_profile = item['speaker_profile']
-            listener_profile = item['listener_profile']
-            topic = item['topic']
-            self.data.append({
-                'conversation_id': conversation_id,
-                'turn': turn,
-                'speaker_profile': speaker_profile,
-                'listener_profile': listener_profile,
-                'topic': topic,
-            })
+
+        if args['mode']=='train':
+            for item in tqdm(self.raw_data, total=len(self.raw_data)):
+                turn = item['turns'][-1]
+                conversation_id = item['conversation_id']
+                speaker_profile = item['speaker_profile']
+                listener_profile = item['listener_profile']
+                topic = item['topic']
+                self.data.append({
+                    'conversation_id': conversation_id,
+                    'turn': turn,
+                    'speaker_profile': speaker_profile,
+                    'listener_profile': listener_profile,
+                    'topic': topic,
+                })
+        else: #test
+            for item in tqdm(self.raw_data, total=len(self.raw_data)):
+                if item['turns']:
+                    turn = item['turns'][-1]
+                    conversation_id = item['conversation_id']
+                    self.data.append({
+                        'conversation_id': conversation_id,
+                        'turn': turn,
+                    })
         
 
     def __len__(self):
