@@ -1,0 +1,9 @@
+env/
+venv/
+.venv/
+conda/
+pip-wheel-metadata/
+ckpt/*
+!ckpt/
+logs/*
+!logs/

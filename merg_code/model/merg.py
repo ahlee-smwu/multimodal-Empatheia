@@ -9,9 +9,14 @@ from .ImageBind import data
 from .common.modeling_llama import LlamaForCausalLM
 from transformers import StoppingCriteria, StoppingCriteriaList
 from .common.utils import *
-import glob
+from .cs_sd import ContentSynchronizer, StyleDisentangler
+from .losses_cs_sd import loss_ccl, loss_sal, loss_cls
 # from speech_generator.generate_audio import StyleTTS2
 # from talking_face_generator.generate_video import generate_video
+from .styletts2_wrap import StyleTTS2Encoders
+from .dreamtalk_wrap import DreamTalkEncoders
+import soundfile as sf
+import cv2
 
 class StoppingCriteriaSub(StoppingCriteria):
 
@@ -19,6 +24,18 @@ class StoppingCriteriaSub(StoppingCriteria):
         super().__init__()
         self.stops = [torch.tensor(stop, dtype=torch.long).cuda() for stop in stops]
         self.ENCOUNTERS = encounters
+        self.cs = ContentSynchronizer(d_in=768, d_latent=512, d_out=768, num_layers=4, nhead=8, dim_ff=2048)
+        self.sd = StyleDisentangler(d_in=768, d_latent=256, d_out=768, num_layers=4, nhead=8, dim_ff=2048)
+        # weights (read from args if provided)
+        self.alpha = float(self.args.get('alpha', 0.3))
+        self.beta = float(self.args.get('beta', 0.3))
+        self.kld_w = float(self.args.get('kld_weight', 1.0e-4))
+
+        # ---- Gold encoders (frozen) ----
+        self.styletts2 = StyleTTS2Encoders(self.args.get('styletts2_ckpt_dir', 'ckpt/styletts2_encoders')).to(
+            self.device)
+        self.dreamtalk = DreamTalkEncoders(self.args.get('dreamtalk_ckpt_dir', 'ckpt/dreamtalk_encoders')).to(
+            self.device)
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):
         for stop_token in self.stops:
@@ -146,13 +163,8 @@ class MERGModel(nn.Module):
         for i in range(len(dia_ids)):
             video_paths = []
             for utt_id in range(max_utt_ids[i]):
-                dia_str = str(dia_ids[i]).zfill(5)
-                pattern = os.path.join(self.args['video_path'], f'dia{dia_str}utt{utt_id + 1}_[0-9]*.mp4')
-                video_pathes = glob.glob(pattern)
-                if not video_pathes:
-                    raise FileNotFoundError(f"No audio file found for pattern: {pattern}")
-                video_paths.append(video_pathes[0])
-
+                video_path = self.args['video_path'] + f'/dia{dia_ids[i]}utt{utt_id+1}.mp4'
+                video_paths.append(video_path)
             inputs = {ModalityType.VISION: data.load_and_transform_video_data(video_paths, self.device)}
                 # convert into visual dtype
             inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}
@@ -177,12 +189,8 @@ class MERGModel(nn.Module):
         for i in range(len(dia_ids)):
             audio_paths = []
             for utt_id in range(max_utt_ids[i]):
-                dia_str = str(dia_ids[i]).zfill(5)
-                pattern = os.path.join(self.args['audio_path'], f'dia{dia_str}utt{utt_id + 1}_[0-9]*.wav')
-                audio_pathes = glob.glob(pattern)
-                if not audio_pathes:
-                    raise FileNotFoundError(f"No audio file found for pattern: {pattern}")
-                audio_paths.append(audio_pathes[0])
+                audio_path = self.args['audio_path'] + f'/dia{dia_ids[i]}utt{utt_id+1}.wav'
+                audio_paths.append(audio_path)
             inputs = {ModalityType.AUDIO: data.load_and_transform_audio_data(audio_paths, self.device)}
             # convert into visual dtype
             inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}
@@ -236,6 +244,117 @@ class MERGModel(nn.Module):
         targets = torch.cat([empty_targets, target_ids], dim=1).to(self.device) 
         return inputs_embeds, targets, attention_mask
 
+    def _extract_signals(self, hidden, input_ids, audio_token_id, video_token_id):
+        """
+        hidden: [B, S, D] last hidden states from LLaMA
+        input_ids: [B, S] token ids used to find <Aud>/<Vid> positions
+        Returns r_t, r_s, r_v as variable-length sequences per batch (padded to max len in-batch).
+        """
+        B, S, D = hidden.shape
+        device = hidden.device
+
+        # masks
+        aud_mask = (input_ids == audio_token_id)
+        vid_mask = (input_ids == video_token_id)
+        # consider "text tokens" as those that are NOT <Aud>/<Vid> and NOT padding (-100)
+        txt_mask = (~aud_mask) & (~vid_mask) & (input_ids != -100)
+
+        # simple gather: keep positions where mask True; pad to max length per mask type
+        def gather(mask):
+            max_len = mask.sum(dim=1).max().item()
+            if max_len == 0:
+                # fallback: at least BOS position (index 0)
+                return hidden[:, :1, :]
+            outs = []
+            for b in range(B):
+                idx = mask[b].nonzero(as_tuple=False).squeeze(-1)
+                if idx.numel() == 0:
+                    outs.append(hidden[b:b+1, :1, :])  # [1,1,D]
+                else:
+                    outs.append(hidden[b:b+1, idx, :])  # [1,Lb,D]
+            # pad to [B, max_len, D]
+            import torch.nn.functional as F
+            outs = [F.pad(x, (0,0,0,int(max_len - x.shape[1]))) for x in outs]
+            return torch.cat(outs, dim=0)
+
+        r_t = gather(txt_mask)  # [B, Lt, D]
+        r_s = gather(aud_mask)  # [B, La, D]
+        r_v = gather(vid_mask)  # [B, Lv, D]
+        return r_t, r_s, r_v
+
+    def _load_golds(self, inputs, last_only=True):
+        """
+        Build gold targets for alignment from your file layout.
+        - For content-text gold (C_s_gold): use gold response text strings.
+        - For content-audio gold (C_v_gold): use response (or last-utterance) audio waveforms.
+        - For style-speech gold (S_s_gold): same waveforms.
+        - For style-video gold (S_v_gold): use response (or last-utterance) video clip tensors.
+        """
+        # ---- C_s_gold: gold response text ----
+        try:
+            targets = [dia['response_text'] for dia in inputs['conversations']]
+        except Exception:
+            # fallback if dataset stores strings directly
+            targets = inputs['conversations']
+
+        # ---- audio/video paths for RESPONSE (or last utterance) ----
+        dia_ids = inputs['dia_ids']
+        max_utt_ids = [len(dia['dialogue_history']) for dia in inputs['conversations']]
+        # choose the last utterance as proxy for response media if explicit response media isn’t stored
+        utt_index = -1 if last_only else 0
+
+        aud_paths_batch = []
+        vid_paths_batch = []
+        for i, did in enumerate(dia_ids):
+            ucount = max_utt_ids[i]
+            u = ucount if utt_index == -1 else 1  # last or first
+            aud_paths_batch.append(os.path.join(self.args['audio_path'], f"dia{did}utt{u}.wav"))
+            vid_paths_batch.append(os.path.join(self.args['video_path'], f"dia{did}utt{u}.mp4"))
+
+        # ---- read audio to tensors (concat or pad) ----
+        wavs = []
+        for p in aud_paths_batch:
+            try:
+                wav, sr = sf.read(p)
+                wav = torch.from_numpy(wav).float().to(self.device)
+            except Exception:
+                wav = torch.zeros(16000, device=self.device)  # 1s silence fallback to keep graph valid
+            wavs.append(wav)
+        # pad to the longest
+        max_w = max(w.shape[0] for w in wavs)
+        wavs = [F.pad(w, (0, max_w - w.shape[0])) for w in wavs]
+        wav_batch = torch.stack(wavs, dim=0)  # [B, T]
+
+        # ---- read short video tensors: [B, T, C, H, W] ----
+        vids = []
+        for p in vid_paths_batch:
+            frames = []
+            cap = cv2.VideoCapture(p)
+            ok = True; t = 0
+            while ok and t < 16:  # 16 frames is plenty for a style encoder
+                ok, fr = cap.read()
+                if ok:
+                    fr = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+                    fr = torch.from_numpy(fr).permute(2,0,1).float()/255.0  # [C,H,W]
+                    frames.append(fr)
+                    t += 1
+            cap.release()
+            if not frames:
+                frames = [torch.zeros(3, 128, 128)]
+            vid = torch.stack(frames, dim=0)  # [T,C,H,W]
+            vids.append(vid)
+        # pad T
+        max_t = max(v.shape[0] for v in vids)
+        vids = [F.pad(v, (0,0,0,0,0,0,0, max_t - v.shape[0])) for v in vids]
+        vid_batch = torch.stack(vids, dim=0).to(self.device)  # [B, T, C, H, W]
+
+        # ---- run encoders (no grad) ----
+        with torch.no_grad():
+            C_s_gold = self.styletts2.text_content(targets).to(self.device)      # [B, 768]
+            C_v_gold = self.dreamtalk.content_from_audio(wav_batch)              # [B, 768] (TorchScript should map)
+            S_s_gold = self.styletts2.style_from_audio(wav_batch)                # [B, 768]
+            S_v_gold = self.dreamtalk.style_from_video(vid_batch)                # [B, 768]
+        return C_s_gold, C_v_gold, S_s_gold, S_v_gold, targets
 
     def _empathetic_diallogue_training(self, target_ids, outputs):
         """
@@ -282,9 +401,45 @@ class MERGModel(nn.Module):
             labels=target_ids
         )
         llama_loss, gen_acc = self._empathetic_diallogue_training(target_ids, outputs)
+
+        # ===== CS/SD integration starts here =====
+        # Hidden states (exclude the very last token if you want strictly "inputs" only)
+        hidden = outputs.hidden_states[-1]  # [B, S, D]
+        audio_token_id = self.llama_tokenizer('<Aud>', add_special_tokens=False).input_ids[0]
+        video_token_id = self.llama_tokenizer('<Vid>', add_special_tokens=False).input_ids[0]
+
+        # r_t (text), r_s (speech markers), r_v (video markers)
+        r_t, r_s, r_v = self._extract_signals(hidden, input_ids, audio_token_id, video_token_id)
+
+        # CS: content heads
+        C_s, C_v, kld_cs = self.cs(r_t)  # -> [B, 768], [B, 768], scalar KL
+
+        # SD: style heads + classification logits
+        S_s, S_v, logits, kld_sd = self.sd(r_s, r_v)
+
+        # Golds from encoders + labels from batch
+        C_s_gold, C_v_gold, S_s_gold, S_v_gold, targets = self._load_golds(inputs)
+        labels = {
+            'emotion': inputs['response_emotion'].to(self.device),
+            'age': inputs['response_profile']['age'].to(self.device),
+            'gender': inputs['response_profile']['gender'].to(self.device),
+            'tone': (inputs['response_profile'].get('timbre', None) or inputs['response_profile']['tone']).to(
+                self.device)
+        }
+
+        L_ccl = loss_ccl(C_s, C_v, C_s_gold, C_v_gold)
+        L_sal = loss_sal(S_s, S_v, S_s_gold, S_v_gold)
+        L_cls = loss_cls(logits, labels)
+        loss_total = llama_loss + self.alpha * L_ccl + self.beta * (L_sal + L_cls) + self.kld_w * (kld_cs + kld_sd)
+        # ===== CS/SD integration ends here =====
+
         return {
             'gen_acc': gen_acc,
-            'loss':llama_loss
+            'loss': loss_total,
+            'loss_llm': llama_loss.detach(),
+            'loss_ccl': L_ccl.detach(),
+            'loss_sal': L_sal.detach(),
+            'loss_cls': L_cls.detach()
         }
     
 
