@@ -1,8 +1,8 @@
-
 seed: 1337
 device: cuda
 
-d_model: 768
+d_in: 4096
+d_out: 768
 nhead: 8
 num_layers: 4
 dim_ff: 2048
@@ -31,7 +31,7 @@ lora_alpha: 32
 lora_dropout: 0.05
 max_len: 1024
 
-styletts2_ckpt_dir: "ckpt/styletts2_encoders"
-dreamtalk_ckpt_dir: "ckpt/dreamtalk_encoders"
+styletts2_ckpt_dir: "ckpt/pretrained_ckpt/styletts2_encoders"
+dreamtalk_ckpt_dir: "ckpt/pretrained_ckpt/dreamtalk_encoders"
 
-out_dir: "runs"
+out_dir: "ckpt/merg-total_ckpt"

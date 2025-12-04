@@ -18,7 +18,6 @@ def parser_args():
     parser = argparse.ArgumentParser(description='train parameters')
     parser.add_argument('--model', type=str, default='merg')
     parser.add_argument('--mode', type=str, default='train', help='train or test')
-    parser.add_argument('--data_path', type=str, default='merg_data')
     parser.add_argument('--audio_path', type=str, default="/mnt/dataset/AvaMERG_jhchoi/AvaMERG/audio_v5_0")
     parser.add_argument('--video_path', type=str, default="/mnt/dataset/AvaMERG_jhchoi/AvaMERG/video_v5_0")
     parser.add_argument('--local_rank', default=0, type=int)
@@ -52,22 +51,16 @@ def main(**args):
     os.makedirs(cfg.out_dir, exist_ok=True)
 
     train_data, train_iter, sampler = load_dataset(args)
-    train_num = train_data.__len__()
-    print(f'################################# Num of training data #######################################: {train_num}')
-    total_steps = args['epochs'] * train_num // dschf.config['train_batch_size']
-    args['total_steps'] = total_steps
 
-    agent = load_model(args)
-    torch.distributed.barrier()
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.llm_model_name, use_fast=True)
     llm = AutoModelForCausalLM.from_pretrained(cfg.llm_model_name, torch_dtype=torch.float16, device_map='auto', output_hidden_states=True)
     peft_cfg = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
     llm = get_peft_model(llm, peft_cfg)
 
-    cs = ContentSynchronizer(d_in=cfg.d_in, d_latent=cfg.d_latent_cs, d_out=cfg.d_out,
+    cs = ContentSynchronizer(d_in=cfg.d_model, d_latent=cfg.d_latent_cs, d_out=cfg.d_model,
                              num_layers=cfg.num_layers, nhead=cfg.nhead, dim_ff=cfg.dim_ff).to(device)
-    sd = StyleDisentangler(d_in=cfg.d_in, d_latent=cfg.d_latent_sd, d_out=cfg.d_out,
+    sd = StyleDisentangler(d_in=cfg.d_model, d_latent=cfg.d_latent_sd, d_out=cfg.d_model,
                            num_layers=cfg.num_layers, nhead=cfg.nhead, dim_ff=cfg.dim_ff).to(device)
     optim = torch.optim.AdamW(list(cs.parameters())+list(sd.parameters())+list(llm.parameters()), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
@@ -76,31 +69,34 @@ def main(**args):
     # drm = DreamTalkEncoders(cfg.dreamtalk_ckpt_dir).to(device)
 
     step=0
-    cs.train(); sd.train()
-    # llm.train()
+    cs.train(); sd.train(); llm.train()
 
     for batch in train_iter:
-        '''mllm(AvaMERG) Model'''
-        outputs, inputs_embeds, input_ids, target_ids, attention_mask = agent.return_output(batch)
-
-        # dialogues = batch['conversations']
-        # targets = batch['conversations'] if isinstance(dialogues[0], str) else [x['response'] for x in dialogues]
-        # inputs = [f"[DIALOGUE]\n{d}\n[TARGET]\n{t}" for d,t in zip(dialogues, targets)]
-        # tok = tokenizer(inputs, return_tensors='pt', padding=True, truncation=True, max_length=cfg.max_len).to(llm.device)
-        # out = llm(**tok, labels=tok['input_ids'])
-        # hs = out.hidden_states[-1]
-
-        hs = outputs.hidden_states[-1]
+        dialogues = batch['conversations']
+        targets = batch['conversations'] if isinstance(dialogues[0], str) else [x['response'] for x in dialogues]
+        inputs = [f"[DIALOGUE]\n{d}\n[TARGET]\n{t}" for d,t in zip(dialogues, targets)]
+        tok = tokenizer(inputs, return_tensors='pt', padding=True, truncation=True, max_length=cfg.max_len).to(llm.device)
+        out = llm(**tok, labels=tok['input_ids'])
+        hs = out.hidden_states[-1]
         r_t, r_s, r_v = hs, hs, hs
 
-        '''CS/SD Modules'''
+        # targets: list[str]
+        tok_plb = tokenizer(
+            targets,
+            return_tensors='pt',
+            padding=True,
+            truncation=True,
+            max_length=cfg.max_len,
+        ).to(device)
+
         C_s, C_v, kld_cs = cs(r_t.to(device))
         S_s, S_v, logits, kld_sd = sd(r_s.to(device), r_v.to(device))
 
-        '''Generators encoding'''
         wav = batch.get('audio', batch.get('wav', None)); video = batch.get('video', None)
         if wav is None or video is None: raise RuntimeError("DataLoader must provide 'audio' and 'video'.")
-        C_s_gold = sty.text_content(input_ids=input_ids, attention_mask=attention_mask).to(device)  # (B, proj_dim)
+        C_s_gold = sty.text_content(
+            input_ids=tok_plb['input_ids'],
+            attention_mask=tok_plb.get('attention_mask', None), ).to(device)  # (B, proj_dim)
         C_v_gold = drm.content_from_audio(wav.to(device))
         S_s_gold = sty.style_from_audio(wav.to(device))
         S_v_gold = drm.style_from_video(video.to(device))

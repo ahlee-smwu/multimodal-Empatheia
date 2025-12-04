@@ -31,6 +31,7 @@
   "bf16": {
     "enabled": false
   },
+  "cpu_optimizer": false,
   "optimizer": {
     "type": "Adam",
     "params": {

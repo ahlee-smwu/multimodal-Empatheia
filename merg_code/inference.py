@@ -10,7 +10,7 @@ import os
 def parser_args():
     parser = argparse.ArgumentParser(description='inference script')
     parser.add_argument('--model', type=str, default='merg')
-    parser.add_argument('--weight_path', type=str, default='ckpt/merg_ckpt2/6')
+    parser.add_argument('--weight_path', type=str, default='ckpt/pretrained_ckpt/vicuna_ckpt/7b_v0')
     parser.add_argument('--audio_path', type=str, default='/mnt/dataset/AvaMERG_jhchoi/AvaMERG/audio_v5_0')
     parser.add_argument('--video_path', type=str, default="/mnt/dataset/AvaMERG_jhchoi/AvaMERG/video_v5_0")
     parser.add_argument('--max_length', type=int, default=1024)
