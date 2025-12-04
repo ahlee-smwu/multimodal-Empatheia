@@ -161,7 +161,7 @@ class multimodal_empathetic_dialogue(Dataset):
         }
 
         self.data = []
-        with open(os.path.join(args['data_path'], args['mode']+'.json'), 'r', encoding='utf-8') as f:
+        with open(os.path.join(args['models']['data_path'], args['mode']+'.json'), 'r', encoding='utf-8') as f:
             self.raw_data = json.load(f)
 
         if args['mode']=='train':

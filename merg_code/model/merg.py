@@ -17,6 +17,7 @@ from .styletts2_wrap import StyleTTS2Encoders
 from .dreamtalk_wrap import DreamTalkEncoders
 import soundfile as sf
 import cv2
+import glob
 
 class StoppingCriteriaSub(StoppingCriteria):
 
@@ -163,8 +164,12 @@ class MERGModel(nn.Module):
         for i in range(len(dia_ids)):
             video_paths = []
             for utt_id in range(max_utt_ids[i]):
-                video_path = self.args['video_path'] + f'/dia{dia_ids[i]}utt{utt_id+1}.mp4'
-                video_paths.append(video_path)
+                dia_str = str(dia_ids[i]).zfill(5)
+                pattern = os.path.join(self.args['video_path'], f'dia{dia_str}utt{utt_id + 1}_[0-9]*.mp4')
+                video_pathes = glob.glob(pattern)
+                if not video_pathes:
+                    raise FileNotFoundError(f"No audio file found for pattern: {pattern}")
+                video_paths.append(video_pathes[0])
             inputs = {ModalityType.VISION: data.load_and_transform_video_data(video_paths, self.device)}
                 # convert into visual dtype
             inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}
@@ -189,8 +194,12 @@ class MERGModel(nn.Module):
         for i in range(len(dia_ids)):
             audio_paths = []
             for utt_id in range(max_utt_ids[i]):
-                audio_path = self.args['audio_path'] + f'/dia{dia_ids[i]}utt{utt_id+1}.wav'
-                audio_paths.append(audio_path)
+                dia_str = str(dia_ids[i]).zfill(5)
+                pattern = os.path.join(self.args['audio_path'], f'dia{dia_str}utt{utt_id + 1}_[0-9]*.wav')
+                audio_pathes = glob.glob(pattern)
+                if not audio_pathes:
+                    raise FileNotFoundError(f"No audio file found for pattern: {pattern}")
+                audio_paths.append(audio_pathes[0])
             inputs = {ModalityType.AUDIO: data.load_and_transform_audio_data(audio_paths, self.device)}
             # convert into visual dtype
             inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}
@@ -441,6 +450,35 @@ class MERGModel(nn.Module):
             'loss_sal': L_sal.detach(),
             'loss_cls': L_cls.detach()
         }
+
+    def forward_llm(self, inputs):
+        input_ids, target_ids, attention_mask = process_batch_text_stream(self.llama_tokenizer,
+                                                                          inputs['conversations'],
+                                                                          self.max_length
+                                                                          )
+        input_ids = input_ids.to(self.device)
+        target_ids = target_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+
+        inputs_audio_embs, audio_llama_atts = self.encode_audio(inputs)
+        inputs_video_embs, video_llama_atts = self.encode_video(inputs)
+        inputs_embeds, target_ids, attention_mask = self.prompt_wrap(
+            inputs_audio_embs,
+            inputs_video_embs,
+            input_ids,
+            target_ids,
+            attention_mask
+        )
+
+        outputs = self.llama_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True,
+            output_hidden_states=True,
+            labels=target_ids
+        )
+
+        return outputs, inputs_embeds, input_ids, target_ids, attention_mask
 
     def return_generate(self, inputs):
         gen_acc = 0

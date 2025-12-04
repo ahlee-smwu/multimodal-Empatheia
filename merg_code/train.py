@@ -50,7 +50,6 @@ def build_directory(path):
 
 def main(**args):
     args = load_config(args)
-    print(args)
     initialize_distributed(args)
     set_random_seed(args['seed'])
     args['ds_config_path'] = f'merg_code/dsconfig/dsconfig.json'
@@ -67,6 +66,8 @@ def main(**args):
             filename=f'{args["log_path"]}/train_{time.asctime()}.log',
             filemode='w'
         )
+    print(args)
+
     train_data, train_iter, sampler = load_dataset(args)
 
     train_num = train_data.__len__()

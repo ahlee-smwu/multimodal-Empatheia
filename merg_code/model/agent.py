@@ -20,7 +20,7 @@ class DeepSpeedAgent:
 
         if self.args['mode']: # org: test mode
             # self.load_parameters(os.path.join(self.args['save_path'], str(self.args['epochs'])))
-            self.load_parameters(os.path.join('ckpt/merg_ckpt/10000'))
+            self.load_parameters(os.path.join('ckpt/merg_ckpt/1'))
 
         # load config parameters of deepspeed
         ds_params = json.load(open(self.args['ds_config_path']))
@@ -43,6 +43,7 @@ class DeepSpeedAgent:
             model=self.model,
             model_parameters=self.model.parameters(),
             config_params=ds_params,
+            optimizer=optimizer,
             dist_init_required=True,
             args=types.SimpleNamespace(**args)
         )
@@ -80,6 +81,12 @@ class DeepSpeedAgent:
 
         mle_acc *= 100
         return mle_acc
+
+    def return_output(self, batch):
+        self.ds_engine.module.train()
+        outputs, inputs_embeds, input_ids, target_ids, attention_mask = self.ds_engine.forward_llm(batch)
+
+        return outputs, inputs_embeds, input_ids, target_ids, attention_mask
 
     def test_model(self, batch, current_step=0, pbar=None):
         self.ds_engine.module.eval()  # 평가 모드
