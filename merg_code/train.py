@@ -3,6 +3,7 @@ from dataset import load_dataset
 from model import *
 from config import load_config
 
+
 # os.environ['RANK'] = '0'
 # os.environ['WORLD_SIZE'] = '1'
 
@@ -16,7 +17,7 @@ def parser_args():
     parser.add_argument('--save_path', type=str, default='ckpt/merg_ckpt2/')
     parser.add_argument('--log_path', type=str, default='ckpt/merg_ckpt2/')
     parser.add_argument('--assets_path', type=str, default='./assets/')
-    parser.add_argument('--max_length', type=int, default=1024)  
+    parser.add_argument('--max_length', type=int, default=1024)
 
     return parser.parse_args()
 
@@ -44,7 +45,7 @@ def set_random_seed(seed):
 def build_directory(path):
     if os.path.exists(path):
         pass
-    else: 
+    else:
         os.makedirs(path, exist_ok=True)
 
 
@@ -71,7 +72,8 @@ def main(**args):
     train_data, train_iter, sampler = load_dataset(args)
 
     train_num = train_data.__len__()
-    print(f'################################# Num of training data #######################################: {train_num}')
+    print(
+        f'################################# Num of training data #######################################: {train_num}')
     length = args['epochs'] * train_num // args['world_size'] // dschf.config[
         'train_micro_batch_size_per_gpu']
     total_steps = args['epochs'] * train_num // dschf.config['train_batch_size']
@@ -79,14 +81,13 @@ def main(**args):
     agent = load_model(args)
     torch.distributed.barrier()
 
-    pbar = tqdm(total=length)  
+    pbar = tqdm(total=length)
     current_step = 0
-
 
     for epoch_i in tqdm(range(args['epochs'])):
         for batch in train_iter:
             agent.train_model(
-                batch, 
+                batch,
                 current_step=current_step,
                 pbar=pbar
             )
@@ -94,8 +95,7 @@ def main(**args):
             if current_step in (3, 10000):
                 agent.save_model(args['save_path'], current_step, current_step)
         torch.distributed.barrier()
-        agent.save_model(args['save_path'], epoch_i+1, current_step)
-    
+        agent.save_model(args['save_path'], epoch_i + 1, current_step)
 
 
 if __name__ == "__main__":

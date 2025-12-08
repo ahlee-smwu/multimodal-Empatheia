@@ -97,9 +97,24 @@ def main(**args):
         C_s, C_v, kld_cs = cs(r_t.to(device))
         S_s, S_v, logits, kld_sd = sd(r_s.to(device), r_v.to(device))
 
+        torch.save(r_t, "merg_code/model/cs_sd_tensor/r_t.pt")
+        torch.save(r_s, "merg_code/model/cs_sd_tensor/r_s.pt")
+        torch.save(r_v, "merg_code/model/cs_sd_tensor/r_v.pt")
+        torch.save(C_s, "merg_code/model/cs_sd_tensor/C_s.pt")
+        torch.save(C_v, "merg_code/model/cs_sd_tensor/C_v.pt")
+        torch.save(kld_cs, "merg_code/model/cs_sd_tensor/kld_cs.pt")
+        torch.save(S_s, "merg_code/model/cs_sd_tensor/S_s.pt")
+        torch.save(S_v, "merg_code/model/cs_sd_tensor/S_v.pt")
+        torch.save(logits, "merg_code/model/cs_sd_tensor/logits.pt")
+        torch.save(kld_sd, "merg_code/model/cs_sd_tensor/kld_sd.pt")
+
+
         '''Generators encoding'''
-        wav = batch.get('audio', batch.get('wav', None)); video = batch.get('video', None)
-        if wav is None or video is None: raise RuntimeError("DataLoader must provide 'audio' and 'video'.")
+        # 데이터셋의 audio/video를 바로 넣어야 generator에 encoding 해야 함
+        wav = batch.get('audio', batch.get('wav', None));
+        video = batch.get('video', None)
+        if wav is None or video is None:
+            raise RuntimeError("DataLoader must provide 'audio' and 'video'.")
         C_s_gold = sty.text_content(input_ids=input_ids, attention_mask=attention_mask).to(device)  # (B, proj_dim)
         C_v_gold = drm.content_from_audio(wav.to(device))
         S_s_gold = sty.style_from_audio(wav.to(device))

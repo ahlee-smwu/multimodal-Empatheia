@@ -9,7 +9,6 @@ class Reparam(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-
 def make_transformer(d_model=768, nhead=8, num_layers=4, dim_ff=2048, dropout=0.1, encoder=True):
     """✅ 근본 수정: Decoder는 norm_first=False"""
     layer = nn.TransformerEncoderLayer if encoder else nn.TransformerDecoderLayer
@@ -19,6 +18,23 @@ def make_transformer(d_model=768, nhead=8, num_layers=4, dim_ff=2048, dropout=0.
     norm_first = encoder  # ✅ 핵심 수정!
     l = layer(d_model, nhead, dim_ff, dropout, batch_first=True, norm_first=norm_first)
     return mod(l, num_layers=num_layers)
+
+# latent-level fusion
+def fuse_gaussian_poe(mu_s, logvar_s, mu_v, logvar_v, eps=1e-8):
+    # σ² = exp(logvar)
+    var_s = torch.exp(logvar_s)
+    var_v = torch.exp(logvar_v)
+
+    precision_s = 1.0 / (var_s + eps)
+    precision_v = 1.0 / (var_v + eps)
+
+    precision_joint = precision_s + precision_v
+    var_joint = 1.0 / (precision_joint + eps)
+
+    mu_joint = (mu_s * precision_s + mu_v * precision_v) * var_joint
+
+    logvar_joint = torch.log(var_joint + eps)
+    return mu_joint, logvar_joint
 
 
 class ContentSynchronizer(nn.Module):
@@ -45,14 +61,14 @@ class ContentSynchronizer(nn.Module):
 
     def _decode(self, mem, q):
         """✅ 안정적 decoder: explicit mask + proper shape"""
-        print('mem', mem.shape)
-        print('q', q.shape)
         B = mem.size(0)
         device = mem.device
         dtype = mem.dtype
 
-        qB = q.expand(B, -1, -1)  # [B, 1, 768]
         mem = mem.to(dtype)  # [B, 1, 768]
+        q = q.to(dtype)
+
+        qB = q.expand(B, -1, -1)  # [B, 1, 768]
 
         # seq_len=1이므로 empty mask
         tgt_mask = torch.zeros((1, 1), dtype=torch.bool, device=device)
@@ -63,12 +79,12 @@ class ContentSynchronizer(nn.Module):
 
     def _cast_layers_to_input_dtype(self, dtype):
         for module in [self.ffn_in, self.enc, self.to_mu, self.to_logvar,
-                       self.latent_to_mem, self.proj_s, self.proj_v]:
+                       self.latent_to_mem, self.dec, self.proj_s, self.proj_v]:
             module.to(dtype)
 
     def forward(self, r_t, return_kld=True):
         """✅ Dynamic shape: [B, T, 4096] or [B*T, 4096]"""
-        self._cast_layers_to_input_dtype(r_t.dtype)
+        self._cast_layers_to_input_dtype(r_t.dtype) # dtype: float16
 
         orig_shape = r_t.shape
         was_flat = len(r_t.shape) == 2
@@ -112,7 +128,6 @@ class StyleDisentangler(nn.Module):
     def __init__(self, d_in=4096, d_latent=256, d_out=768, num_layers=4, nhead=8, dim_ff=2048, qdim=768,
                  n_emotions=7, n_age=4, n_gender=2, n_tone=3):
         super().__init__()
-        self.d_out = d_out
 
         self.ffn_s = nn.Linear(d_in, d_out)
         self.ffn_v = nn.Linear(d_in, d_out)
@@ -149,48 +164,52 @@ class StyleDisentangler(nn.Module):
         return h.mean(dim=1)
 
     def _decode_query(self, mem, q, proj):
-        """✅ StyleDisentangler용 decoder"""
+        """z -> E/P using query"""
         B = mem.size(0)
-        device = mem.device
-        dtype = mem.dtype
-
         qB = q.expand(B, -1, -1)
-        mem = mem.to(dtype)
+        out = self.dec(tgt=qB, memory=mem)
+        return proj(out[:, 0, :])  # [B, 768] # aisha에 있던 mask 코드 삭제(유진)
 
-        tgt_mask = torch.zeros((1, 1), dtype=torch.bool, device=device)
-
-        with torch.no_grad():
-            out = self.dec(tgt=qB, memory=mem, tgt_mask=tgt_mask)
-        return proj(out[:, 0, :])
+    def _cast_layers_to_input_dtype(self, dtype):
+        for module in [self.ffn_s, self.ffn_v, self.enc_s, self.enc_v, self.to_mu_e, self.to_mu_p, self.to_logvar_e, self.to_logvar_p,
+                       self.q_s_e, self.q_v_e, self.q_s_p, self.q_v_p, self.latent_to_mem_e, self.latent_to_mem_p,
+                       self.dec, self.head_e, self.head_p, self.fuser_s, self.fuser_v,
+                       self.cls_emotion, self.cls_age, self.cls_gender, self.cls_tone]:
+            module.to(dtype)
 
     def forward(self, r_s, r_v, return_kld=True):
-        """✅ Dynamic shape 지원"""
+        """
+        r_s, r_v: [B, T, 4096]
+        -> S_s, S_v: [B, 768] (StyleTTS2/DreamTalk style input)
+        -> logits: classification supervision
+        """
+        self._cast_layers_to_input_dtype(r_s.dtype) # dtype: float16
 
-        def reshape_input(x):
-            orig_shape = x.shape
-            was_flat = len(x.shape) == 2
-            if was_flat:
-                x = x.unsqueeze(1)
-            return x, orig_shape, was_flat
-
-        r_s, orig_s, flat_s = reshape_input(r_s)
-        r_v, orig_v, flat_v = reshape_input(r_v)
-
-        # 1. Encode
-        hs = self._encode_pool(self.enc_s, self.ffn_s, r_s)
+        # 1. Encode r_s, r_v separately (논문 수식 3,5)
+        hs = self._encode_pool(self.enc_s, self.ffn_s, r_s)  # [B, 768]
         hv = self._encode_pool(self.enc_v, self.ffn_v, r_v)
 
-        # 2. Emotion
+        ####################수정부분###################
         mu_e_s, logvar_e_s = self.to_mu_e(hs), self.to_logvar_e(hs)
         mu_e_v, logvar_e_v = self.to_mu_e(hv), self.to_logvar_e(hv)
-        z_e_s = self.reparam(mu_e_s, logvar_e_s)
-        z_e_v = self.reparam(mu_e_v, logvar_e_v)
-        mem_e_s = self.latent_to_mem_e(z_e_s).unsqueeze(1)
-        mem_e_v = self.latent_to_mem_e(z_e_v).unsqueeze(1)
+
+        mu_e, logvar_e = fuse_gaussian_poe(mu_e_s, logvar_e_s, mu_e_v, logvar_e_v)
+        temp = 1.5
+        logvar_e_scaled = logvar_e + 2 * torch.log(torch.tensor(temp, device=logvar_e.device, dtype=logvar_e.dtype))
+        z_fusion = self.reparam(mu_e, logvar_e_scaled)
+        ####################수정부분###################
+
+        # 2. Emotion disentangling (논문 수식 3-4)
+        #mu_e_s, logvar_e_s = self.to_mu_e(hs), self.to_logvar_e(hs)
+        #mu_e_v, logvar_e_v = self.to_mu_e(hv), self.to_logvar_e(hv)
+        #z_e_s = self.reparam(mu_e_s, logvar_e_s)
+        #z_e_v = self.reparam(mu_e_v, logvar_e_v)
+        mem_e_s = self.latent_to_mem_e(z_fusion).unsqueeze(1)
+        mem_e_v = self.latent_to_mem_e(z_fusion).unsqueeze(1)
         E_s = self._decode_query(mem_e_s, self.q_s_e, self.head_e)
         E_v = self._decode_query(mem_e_v, self.q_v_e, self.head_e)
 
-        # 3. Profile
+        # 3. Profile disentangling (논문 수식 5-6)
         mu_p_s, logvar_p_s = self.to_mu_p(hs), self.to_logvar_p(hs)
         mu_p_v, logvar_p_v = self.to_mu_p(hv), self.to_logvar_p(hv)
         z_p_s = self.reparam(mu_p_s, logvar_p_s)
@@ -200,13 +219,15 @@ class StyleDisentangler(nn.Module):
         P_s = self._decode_query(mem_p_s, self.q_s_p, self.head_p)
         P_v = self._decode_query(mem_p_v, self.q_v_p, self.head_p)
 
-        # 4. Style fusion
-        S_s = self.fuser_s(torch.cat([E_s, P_s], dim=-1))
+        # 4. Style fusion (논문 수식 7)
+        S_s = self.fuser_s(torch.cat([E_s, P_v], dim=-1))
         S_v = self.fuser_v(torch.cat([E_v, P_v], dim=-1))
+        #S_s = self.fuser_s(torch.cat([E_s, P_s], dim=-1))  # [B, 768]
+        #S_v = self.fuser_v(torch.cat([E_v, P_v], dim=-1))
 
-        # 5. Classification
-        E_global = 0.5 * (E_s + E_v)
-        P_global = 0.5 * (P_s + P_v)
+        # 5. Global features for classification supervision (논문 D.3 Step3)
+        E_global = 0.5 * (E_s + E_v)  # fuse E_s, E_v
+        P_global = 0.5 * (P_s + P_v)  # fuse P_s, P_v
         logits = {
             'emotion': self.cls_emotion(E_global),
             'age': self.cls_age(P_global),
@@ -214,18 +235,12 @@ class StyleDisentangler(nn.Module):
             'tone': self.cls_tone(P_global)
         }
 
-        # 6. KLD
+        # 6. KLD loss (training에서만 사용)
         kld = 0.0
         if return_kld:
             for mu, logvar in [(mu_e_s, logvar_e_s), (mu_e_v, logvar_e_v),
                                (mu_p_s, logvar_p_s), (mu_p_v, logvar_p_v)]:
                 kld += -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1).mean()
-
-        # ✅ Shape 복원
-        if flat_s:
-            S_s = S_s.view(orig_s[0], -1).mean(dim=1)
-        if flat_v:
-            S_v = S_v.view(orig_v[0], -1).mean(dim=1)
 
         return S_s, S_v, logits, kld
 
@@ -238,15 +253,9 @@ if __name__ == "__main__":
     r_s = torch.randn(B, T, 4096)
     r_v = torch.randn(B, T, 4096)
 
-    cs = ContentSynchronizer()
-    C_s, C_v, kld_cs = cs(r_t)
-    print(f"CS Normal: C_s={C_s.shape}, C_v={C_v.shape}")
-
-    sd = StyleDisentangler()
-    S_s, S_v, logits, kld_sd = sd(r_s, r_v)
-    print(f"SD Normal: S_s={S_s.shape}, S_v={S_v.shape}")
-
-    # Test 2: Flat shape (실제 에러 상황)
-    r_t_flat = torch.randn(441, 4096)  # 21*21
-    C_s_flat, C_v_flat, _ = cs(r_t_flat)
-    print(f"CS Flat: C_s={C_s_flat.shape}, C_v={C_v_flat.shape}")
+    cs = ContentSynchronizer(d_in=4096, d_latent=512, d_out=768,
+                             num_layers=4, nhead=8, dim_ff=2048).to('cuda')
+    sd = StyleDisentangler(d_in=4096, d_latent=256, d_out=768,
+                           num_layers=4, nhead=8, dim_ff=2048).to('cuda')
+    C_s, C_v, kld_cs = cs(r_t.to('cuda'))
+    S_s, S_v, logits, kld_sd = sd(r_s.to('cuda'), r_v.to('cuda'))
