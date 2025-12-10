@@ -2,7 +2,7 @@ models:
   merg:
     model_name: MERGModel
     agent_name: DeepSpeedAgent #AccelerateAgent
-  data_path: merg_data
+  data_path: /home/a6000/bk-project/multimodal-Empatheia/merg_data
   max_length: 512
   max_response_length: 512
   logging_step: 50
@@ -13,7 +13,7 @@ models:
   alpha: 0.3
   beta: 0.3
   kld_weight: 0.0001
-  styletts2_ckpt_dir: ckpt/styletts2_encoders
+  styletts2_ckpt_dir: /home/a6000/bk-project/multimodal-Empatheia/ckpt/pretrained_ckpt/styletts2_encoders
   dreamtalk_ckpt_dir: ckpt/dreamtalk_encoders
 seed: 13
 epochs: 6
@@ -30,4 +30,4 @@ num_gen_vid_tokens: 16
 log_path: ./logs/
 save_path: ckpt/merg_ckpt/
 vicuna_version: 7b_v0
-pretrained_ckpt_path: ckpt/pretrained_ckpt/
+pretrained_ckpt_path: /home/a6000/bk-project/multimodal-Empatheia/ckpt/pretrained_ckpt
