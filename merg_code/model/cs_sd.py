@@ -20,6 +20,23 @@ def make_transformer(d_model=768, nhead=8, num_layers=4, dim_ff=2048, dropout=0.
     l = layer(d_model, nhead, dim_ff, dropout, batch_first=True, norm_first=norm_first)
     return mod(l, num_layers=num_layers)
 
+# latent-level fusion
+def fuse_gaussian_poe(mu_s, logvar_s, mu_v, logvar_v, eps=1e-8):
+    # σ² = exp(logvar)
+    var_s = torch.exp(logvar_s)
+    var_v = torch.exp(logvar_v)
+
+    precision_s = 1.0 / (var_s + eps)
+    precision_v = 1.0 / (var_v + eps)
+
+    precision_joint = precision_s + precision_v
+    var_joint = 1.0 / (precision_joint + eps)
+
+    mu_joint = (mu_s * precision_s + mu_v * precision_v) * var_joint
+
+    logvar_joint = torch.log(var_joint + eps)
+    return mu_joint, logvar_joint
+
 
 class ContentSynchronizer(nn.Module):
     """논문 4.3: Transformer-based VAE, z_c^{s/v} = EncCS(FFN(r_t), q_c^{s/v})"""
@@ -45,8 +62,6 @@ class ContentSynchronizer(nn.Module):
 
     def _decode(self, mem, q):
         """✅ 안정적 decoder: explicit mask + proper shape"""
-        print('mem', mem.shape)
-        print('q', q.shape)
         B = mem.size(0)
         device = mem.device
         dtype = mem.dtype
@@ -63,8 +78,10 @@ class ContentSynchronizer(nn.Module):
 
     def _cast_layers_to_input_dtype(self, dtype):
         for module in [self.ffn_in, self.enc, self.to_mu, self.to_logvar,
-                       self.latent_to_mem, self.proj_s, self.proj_v]:
+                       self.latent_to_mem, self.dec, self.proj_s, self.proj_v]:
             module.to(dtype)
+        self.q_s_c.data = self.q_s_c.data.to(dtype)
+        self.q_v_c.data = self.q_v_c.data.to(dtype)
 
     def forward(self, r_t, return_kld=True):
         """✅ Dynamic shape: [B, T, 4096] or [B*T, 4096]"""
@@ -163,8 +180,25 @@ class StyleDisentangler(nn.Module):
             out = self.dec(tgt=qB, memory=mem, tgt_mask=tgt_mask)
         return proj(out[:, 0, :])
 
+    def _cast_layers_to_input_dtype(self, dtype):
+        # Linear / Transformer 모듈들 dtype 통일
+        for module in [
+            self.ffn_s, self.ffn_v, self.enc_s, self.enc_v,
+            self.to_mu_e, self.to_logvar_e, self.to_mu_p, self.to_logvar_p,
+            self.latent_to_mem_e, self.latent_to_mem_p,
+            self.dec, self.head_e, self.head_p, self.fuser_s, self.fuser_v,
+            self.cls_emotion, self.cls_age, self.cls_gender, self.cls_tone,]:
+            module.to(dtype)
+
+        # learnable query 파라미터들 dtype 통일
+        self.q_s_e.data = self.q_s_e.data.to(dtype)
+        self.q_v_e.data = self.q_v_e.data.to(dtype)
+        self.q_s_p.data = self.q_s_p.data.to(dtype)
+        self.q_v_p.data = self.q_v_p.data.to(dtype)
+
     def forward(self, r_s, r_v, return_kld=True):
         """✅ Dynamic shape 지원"""
+        self._cast_layers_to_input_dtype(r_s.dtype)
 
         def reshape_input(x):
             orig_shape = x.shape
@@ -238,15 +272,9 @@ if __name__ == "__main__":
     r_s = torch.randn(B, T, 4096)
     r_v = torch.randn(B, T, 4096)
 
-    cs = ContentSynchronizer()
-    C_s, C_v, kld_cs = cs(r_t)
-    print(f"CS Normal: C_s={C_s.shape}, C_v={C_v.shape}")
-
-    sd = StyleDisentangler()
-    S_s, S_v, logits, kld_sd = sd(r_s, r_v)
-    print(f"SD Normal: S_s={S_s.shape}, S_v={S_v.shape}")
-
-    # Test 2: Flat shape (실제 에러 상황)
-    r_t_flat = torch.randn(441, 4096)  # 21*21
-    C_s_flat, C_v_flat, _ = cs(r_t_flat)
-    print(f"CS Flat: C_s={C_s_flat.shape}, C_v={C_v_flat.shape}")
+    cs = ContentSynchronizer(d_in=4096, d_latent=512, d_out=768,
+                             num_layers=4, nhead=8, dim_ff=2048).to('cuda')
+    sd = StyleDisentangler(d_in=4096, d_latent=256, d_out=768,
+                           num_layers=4, nhead=8, dim_ff=2048).to('cuda')
+    C_s, C_v, kld_cs = cs(r_t.to('cuda'))
+    S_s, S_v, logits, kld_sd = sd(r_s.to('cuda'), r_v.to('cuda'))
