@@ -114,7 +114,8 @@ def main(**args):
         wav = batch.get('audio', batch.get('wav', None));
         video = batch.get('video', None)
         if wav is None or video is None:
-            raise RuntimeError("DataLoader must provide 'audio' and 'video'.")
+            pass
+            # raise RuntimeError("DataLoader must provide 'audio' and 'video'.")
         C_s_gold = sty.text_content(input_ids=input_ids, attention_mask=attention_mask).to(device)  # (B, proj_dim)
         C_v_gold = drm.content_from_audio(wav.to(device))
         S_s_gold = sty.style_from_audio(wav.to(device))

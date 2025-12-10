@@ -45,6 +45,11 @@ class multimodal_empathetic_dialogue(Dataset):
     def __init__(self, args):
         super(multimodal_empathetic_dialogue, self).__init__()
         self.args = args
+        # ★ ADD THIS BLOCK RIGHT HERE
+        models_cfg = args.get('models', {})
+        self.audio_path = models_cfg.get('audio_path', None)
+        self.video_path = models_cfg.get('video_path', None)
+        # ★ END NEW BLOCK
         self.age_projection = {
             "child": 0,
             "young": 1,
@@ -183,11 +188,28 @@ class multimodal_empathetic_dialogue(Dataset):
                 if item['turns']:
                     turn = item['turns'][-1]
                     conversation_id = item['conversation_id']
+                    speaker_profile = item['speaker_profile']
+                    listener_profile = item['listener_profile']
+                    topic = item['topic']
+
                     self.data.append({
                         'conversation_id': conversation_id,
                         'turn': turn,
+                        'speaker_profile': speaker_profile,
+                        'listener_profile': listener_profile,
+                        'topic': topic,
                     })
-        
+                else:  # test
+                    for item in tqdm(self.raw_data, total=len(self.raw_data)):
+                        if item['turns']:
+                            turn = item['turns'][-1]
+                            conversation_id = item['conversation_id']
+                            self.data.append({
+                                'conversation_id': conversation_id,
+                                'turn': turn,
+                            })
+                self.audio_path = args['models'].get('audio_path', None)
+                self.video_path = args['models'].get('video_path', None)
 
     def __len__(self):
         return len(self.data)
@@ -198,6 +220,12 @@ class multimodal_empathetic_dialogue(Dataset):
         length = len(item['turn']['dialogue_history'])
 
         response_utt_name = f'dia{dia_id}utt{length+1}'
+        response_wav = None
+        response_video = None
+        if self.audio_path is not None:
+            response_wav = self.load_tensor(self.audio_path, response_utt_name)
+        if self.video_path is not None:
+            response_video = self.load_tensor(self.video_path, response_utt_name)
 
         data = {
             'dia_id': dia_id,
@@ -210,7 +238,10 @@ class multimodal_empathetic_dialogue(Dataset):
             'response_age': self.age_projection[item['listener_profile']['age']],
             'response_gender':self.gender_projection[item['listener_profile']['gender']],
             'response_timbre':self.timbre_projection[item['listener_profile']['timbre']],
-            'profile_id':self.profile_projection[item['listener_profile']['age'] + '_' + item['listener_profile']['gender'] + '_' + item['listener_profile']['timbre']]
+            'profile_id':self.profile_projection[item['listener_profile']['age'] + '_' + item['listener_profile']['gender'] + '_' + item['listener_profile']['timbre']],
+            # ★ NEW: raw tensors that Stage3 SAL will use
+            'response_wav': response_wav,  # torch.Tensor or None
+            'response_video': response_video,  # torch.Tensor or None
         }
         return data  
 
@@ -234,7 +265,9 @@ class multimodal_empathetic_dialogue(Dataset):
         response_timbre = [instance['response_timbre'] for instance in batch]
         response_emotion = [instance['response_emotion'] for instance in batch]
         response_profile = [instance['profile_id'] for instance in batch]
-        
+        # ★ NEW: collect wav & video
+        response_wav = [instance['response_wav'] for instance in batch]
+        response_video = [instance['response_video'] for instance in batch]
 
         dialogue_history = [instance['dialogue_history'] for instance in batch]
         response = [instance['response'] for instance in batch]
@@ -256,7 +289,10 @@ class multimodal_empathetic_dialogue(Dataset):
                 'response_emotion': response_emotion,
                 'response_gender': response_gender,
                 'response_timbre': response_timbre,
-                'response_profile': response_profile
+                'response_profile': response_profile,
+                # ★ NEW: what Stage3 SAL is screaming for
+                'response_wav': response_wav,
+                'response_video': response_video,
                 }
     
 

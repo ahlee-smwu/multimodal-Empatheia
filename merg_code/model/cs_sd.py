@@ -81,6 +81,8 @@ class ContentSynchronizer(nn.Module):
         for module in [self.ffn_in, self.enc, self.to_mu, self.to_logvar,
                        self.latent_to_mem, self.dec, self.proj_s, self.proj_v]:
             module.to(dtype)
+        self.q_s_c.data = self.q_s_c.data.to(dtype)
+        self.q_v_c.data = self.q_v_c.data.to(dtype)
 
     def forward(self, r_t, return_kld=True):
         """✅ Dynamic shape: [B, T, 4096] or [B*T, 4096]"""
@@ -177,16 +179,38 @@ class StyleDisentangler(nn.Module):
                        self.cls_emotion, self.cls_age, self.cls_gender, self.cls_tone]:
             module.to(dtype)
 
-    def forward(self, r_s, r_v, return_kld=True):
-        """
-        r_s, r_v: [B, T, 4096]
-        -> S_s, S_v: [B, 768] (StyleTTS2/DreamTalk style input)
-        -> logits: classification supervision
-        """
-        self._cast_layers_to_input_dtype(r_s.dtype) # dtype: float16
+    def _cast_layers_to_input_dtype(self, dtype):
+        # Linear / Transformer 모듈들 dtype 통일
+        for module in [
+            self.ffn_s, self.ffn_v, self.enc_s, self.enc_v,
+            self.to_mu_e, self.to_logvar_e, self.to_mu_p, self.to_logvar_p,
+            self.latent_to_mem_e, self.latent_to_mem_p,
+            self.dec, self.head_e, self.head_p, self.fuser_s, self.fuser_v,
+            self.cls_emotion, self.cls_age, self.cls_gender, self.cls_tone,]:
+            module.to(dtype)
 
-        # 1. Encode r_s, r_v separately (논문 수식 3,5)
-        hs = self._encode_pool(self.enc_s, self.ffn_s, r_s)  # [B, 768]
+        # learnable query 파라미터들 dtype 통일
+        self.q_s_e.data = self.q_s_e.data.to(dtype)
+        self.q_v_e.data = self.q_v_e.data.to(dtype)
+        self.q_s_p.data = self.q_s_p.data.to(dtype)
+        self.q_v_p.data = self.q_v_p.data.to(dtype)
+
+    def forward(self, r_s, r_v, return_kld=True):
+        """✅ Dynamic shape 지원"""
+        self._cast_layers_to_input_dtype(r_s.dtype)
+
+        def reshape_input(x):
+            orig_shape = x.shape
+            was_flat = len(x.shape) == 2
+            if was_flat:
+                x = x.unsqueeze(1)
+            return x, orig_shape, was_flat
+
+        r_s, orig_s, flat_s = reshape_input(r_s)
+        r_v, orig_v, flat_v = reshape_input(r_v)
+
+        # 1. Encode
+        hs = self._encode_pool(self.enc_s, self.ffn_s, r_s)
         hv = self._encode_pool(self.enc_v, self.ffn_v, r_v)
 
         ####################수정부분###################
