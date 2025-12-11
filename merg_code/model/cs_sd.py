@@ -153,8 +153,8 @@ class StyleDisentangler(nn.Module):
 
         self.head_e = nn.Linear(d_out, d_out)
         self.head_p = nn.Linear(d_out, d_out)
-        self.fuser_s = nn.Linear(d_out * 2, d_out)
-        self.fuser_v = nn.Linear(d_out * 2, d_out)
+        self.fuser_s = nn.Linear(d_out * 2, 192)
+        self.fuser_v = nn.Linear(d_out * 2, d_out) # StyleTTS2->JDCNet output dim
 
         self.cls_emotion = nn.Linear(d_out, n_emotions)
         self.cls_age = nn.Linear(d_out, n_age)
@@ -253,10 +253,10 @@ class StyleDisentangler(nn.Module):
         E_global = 0.5 * (E_s + E_v)  # fuse E_s, E_v
         P_global = 0.5 * (P_s + P_v)  # fuse P_s, P_v
         logits = {
-            'emotion': self.cls_emotion(E_global),
-            'age': self.cls_age(P_global),
-            'gender': self.cls_gender(P_global),
-            'tone': self.cls_tone(P_global)
+            'emotion': self.cls_emotion(E_global).softmax(dim=-1).argmax(dim=-1),
+            'age': self.cls_age(P_global).softmax(dim=-1).argmax(dim=-1),
+            'gender': self.cls_gender(P_global).softmax(dim=-1).argmax(dim=-1),
+            'timbre': self.cls_tone(P_global).softmax(dim=-1).argmax(dim=-1) # tone = timbre
         }
 
         # 6. KLD loss (training에서만 사용)
@@ -271,6 +271,11 @@ class StyleDisentangler(nn.Module):
 
 # 테스트
 if __name__ == "__main__":
+    C_s = torch.load('/home/ahlee/bk/multimodal-Empatheia/merg_code/model/cs_sd_tensor/C_s.pt') # (1,768)
+    C_v = torch.load('/home/ahlee/bk/multimodal-Empatheia/merg_code/model/cs_sd_tensor/C_v.pt') # (1,768)
+    S_s = torch.load('/home/ahlee/bk/multimodal-Empatheia/merg_code/model/cs_sd_tensor/S_s.pt') # (1,768)
+    S_v = torch.load('/home/ahlee/bk/multimodal-Empatheia/merg_code/model/cs_sd_tensor/S_v.pt') # (1,768)
+
     # Test 1: Normal shape
     B, T = 4, 10
     r_t = torch.randn(B, T, 4096)

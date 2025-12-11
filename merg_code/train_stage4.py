@@ -21,6 +21,7 @@ def parser_args():
     parser.add_argument('--data_path', type=str, default='merg_data')
     parser.add_argument('--audio_path', type=str, default="/mnt/dataset/AvaMERG_jhchoi/AvaMERG/audio_v5_0")
     parser.add_argument('--video_path', type=str, default="/mnt/dataset/AvaMERG_jhchoi/AvaMERG/video_v5_0")
+    parser.add_argument('--ckpt_path', type=str, default="ckpt/merg_ckpt/10000")
     parser.add_argument('--local_rank', default=0, type=int)
     parser.add_argument('--save_path', type=str, default='ckpt/merg_ckpt_total/')
     parser.add_argument('--log_path', type=str, default='ckpt/merg_ckpt_total/')
@@ -39,6 +40,7 @@ def initialize_distributed(args):
     deepspeed.init_distributed(dist_backend='nccl')
 
 def main(**args):
+    '''config'''
     args = load_config(args)
     args['ds_config_path'] = f'merg_code/dsconfig/dsconfig.json'
     dschf = HfDeepSpeedConfig(args['ds_config_path'])
@@ -51,90 +53,123 @@ def main(**args):
     device = torch.device(cfg.device if torch.cuda.is_available() else 'cpu')
     os.makedirs(cfg.out_dir, exist_ok=True)
 
+    '''dataset'''
     train_data, train_iter, sampler = load_dataset(args)
     train_num = train_data.__len__()
     print(f'################################# Num of training data #######################################: {train_num}')
     total_steps = args['epochs'] * train_num // dschf.config['train_batch_size']
     args['total_steps'] = total_steps
 
+    '''MLLM(AvaMERG) model'''
     agent = load_model(args)
     torch.distributed.barrier()
-
-    tokenizer = AutoTokenizer.from_pretrained(cfg.llm_model_name, use_fast=True)
-    llm = AutoModelForCausalLM.from_pretrained(cfg.llm_model_name, torch_dtype=torch.float16, device_map='auto', output_hidden_states=True)
-    peft_cfg = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout)
-    llm = get_peft_model(llm, peft_cfg)
-
+    '''CS/CD module'''
     cs = ContentSynchronizer(d_in=cfg.d_in, d_latent=cfg.d_latent_cs, d_out=cfg.d_out,
                              num_layers=cfg.num_layers, nhead=cfg.nhead, dim_ff=cfg.dim_ff).to(device)
     sd = StyleDisentangler(d_in=cfg.d_in, d_latent=cfg.d_latent_sd, d_out=cfg.d_out,
                            num_layers=cfg.num_layers, nhead=cfg.nhead, dim_ff=cfg.dim_ff).to(device)
-    optim = torch.optim.AdamW(list(cs.parameters())+list(sd.parameters())+list(llm.parameters()), lr=cfg.lr, weight_decay=cfg.weight_decay)
-
+    optim = torch.optim.AdamW(
+        list(cs.parameters()) +
+        list(sd.parameters()),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+    )
+    '''Generator encoder module'''
     sty = StyleTTS2Encoders(cfg.styletts2_ckpt_dir).to(device)
     drm = sty
     # drm = DreamTalkEncoders(cfg.dreamtalk_ckpt_dir).to(device)
 
+    '''train loop'''
     step=0
+    agent.ds_engine.eval() # frozen
     cs.train(); sd.train()
-    # llm.train()
 
     for batch in train_iter:
-        '''mllm(AvaMERG) Model'''
-        outputs, inputs_embeds, input_ids, target_ids, attention_mask = agent.return_output(batch)
+        ''' # batch content
+        {'dia_ids': ['17677'],
+         'conversations': [{'dialogue_history': [{'index': 0,
+                                                  'role': 'speaker',
+                                                  'utterance': "I just feel like I'm constantly juggling everything and it's wearing me down."},
+                                                 {'index': 1,
+                                                  'role': 'listener',
+                                                  'utterance': 'That sounds really tough. It must be exhausting to manage so much all at once.'},
+                                                 {'index': 2,
+                                                  'role': 'speaker',
+                                                  'utterance': "It's like no matter how hard I try, I can't seem to find a balance."},
+                                                 {'index': 3,
+                                                  'role': 'listener',
+                                                  'utterance': 'Finding that balance can be really challenging, especially with so many expectations.'},
+                                                 {'index': 4,
+                                                  'role': 'speaker',
+                                                  'utterance': "I just wish I could catch a break and feel like I'm on top of things again."}],
+                            'response': "Everyone has moments like these, and it's okay to ask for help when you need it.",
+                            'coe': {'speaker_emotion': 'anxious',
+                                    'event_scenario': 'Feeling the need for a break',
+                                    'emotion_cause': 'The pressure of managing responsibilities without relief',
+                                    'goal_to_response': 'To find reassurance that seeking help is acceptable'}}],
+         'response_age': [2],
+         'response_emotion': [4],
+         'response_gender': [0],
+         'response_timbre': [2],
+         'response_profile': [14],
+         'response_audio': [None],
+         'response_video': [None]} '''
 
-        # dialogues = batch['conversations']
-        # targets = batch['conversations'] if isinstance(dialogues[0], str) else [x['response'] for x in dialogues]
-        # inputs = [f"[DIALOGUE]\n{d}\n[TARGET]\n{t}" for d,t in zip(dialogues, targets)]
-        # tok = tokenizer(inputs, return_tensors='pt', padding=True, truncation=True, max_length=cfg.max_len).to(llm.device)
-        # out = llm(**tok, labels=tok['input_ids'])
-        # hs = out.hidden_states[-1]
+        '''MLLM(AvaMERG) model'''
+        outputs, inputs_embeds, input_ids, target_ids, attention_mask = agent.return_output(batch)
 
         hs = outputs.hidden_states[-1]
         r_t, r_s, r_v = hs, hs, hs
 
         '''CS/SD Modules'''
-        C_s, C_v, kld_cs = cs(r_t.to(device))
-        S_s, S_v, logits, kld_sd = sd(r_s.to(device), r_v.to(device))
+        C_s, C_v, kld_cs = cs(r_t.to(device))  # (B,768)
+        S_s, S_v, logits, kld_sd = sd(r_s.to(device), r_v.to(device))  # (B,192), (B,768)
 
-        torch.save(r_t, "merg_code/model/cs_sd_tensor/r_t.pt")
-        torch.save(r_s, "merg_code/model/cs_sd_tensor/r_s.pt")
-        torch.save(r_v, "merg_code/model/cs_sd_tensor/r_v.pt")
-        torch.save(C_s, "merg_code/model/cs_sd_tensor/C_s.pt")
-        torch.save(C_v, "merg_code/model/cs_sd_tensor/C_v.pt")
-        torch.save(kld_cs, "merg_code/model/cs_sd_tensor/kld_cs.pt")
-        torch.save(S_s, "merg_code/model/cs_sd_tensor/S_s.pt")
-        torch.save(S_v, "merg_code/model/cs_sd_tensor/S_v.pt")
-        torch.save(logits, "merg_code/model/cs_sd_tensor/logits.pt")
-        torch.save(kld_sd, "merg_code/model/cs_sd_tensor/kld_sd.pt")
+        # torch.save(r_t, "merg_code/model/cs_sd_tensor/r_t.pt")
+        # torch.save(r_s, "merg_code/model/cs_sd_tensor/r_s.pt")
+        # torch.save(r_v, "merg_code/model/cs_sd_tensor/r_v.pt")
+        # torch.save(C_s, "merg_code/model/cs_sd_tensor/C_s.pt")
+        # torch.save(C_v, "merg_code/model/cs_sd_tensor/C_v.pt")
+        # torch.save(kld_cs, "merg_code/model/cs_sd_tensor/kld_cs.pt")
+        # torch.save(S_s, "merg_code/model/cs_sd_tensor/S_s.pt")
+        # torch.save(S_v, "merg_code/model/cs_sd_tensor/S_v.pt")
+        # torch.save(logits, "merg_code/model/cs_sd_tensor/logits.pt")
+        # torch.save(kld_sd, "merg_code/model/cs_sd_tensor/kld_sd.pt")
 
-
-        '''Generators encoding'''
+        '''Generator encoder module'''
         # 데이터셋의 audio/video를 바로 넣어야 generator에 encoding 해야 함
-        wav = batch.get('audio', batch.get('wav', None));
-        video = batch.get('video', None)
-        if wav is None or video is None:
-            pass
-            # raise RuntimeError("DataLoader must provide 'audio' and 'video'.")
-        C_s_gold = sty.text_content(input_ids=input_ids, attention_mask=attention_mask).to(device)  # (B, proj_dim)
-        C_v_gold = drm.content_from_audio(wav.to(device))
-        S_s_gold = sty.style_from_audio(wav.to(device))
-        S_v_gold = drm.style_from_video(video.to(device))
 
-        prof = batch['response_profile']
+        response = [conv["response"] for conv in batch["conversations"]]
+        response_aud = [item for sublist in batch["response_audio"] for item in sublist]
+        response_vid = [item for sublist in batch["response_video"] for item in sublist]
+        if (response_vid is None or len(response_vid) == 0 or
+            response_aud is None or len(response_aud) == 0
+        ):
+            continue
+
+        C_s_gold = sty.text_content(response).to(device)  # (B, 768)
+        C_v_gold = torch.zeros(1, 768).to(device) #drm.content_from_audio(response_aud).to(device)
+        S_s_gold = sty.style_from_audio(response_aud).reshape(-1, 192).to(device) # (B,192)
+        S_v_gold = torch.zeros(1, 768).to(device) #drm.style_from_video(response_vid).to(device)
+
+        # 여기까지 끝냄 이제 loss만 보면 됨
+
         labels = {
-            'emotion': batch['response_emotion'].to(device),
-            'age':     prof['age'].to(device),
-            'gender':  prof['gender'].to(device),
-            'tone':    (prof.get('timbre', None) or prof.get('tone')).to(device)
+            'emotion': batch['response_emotion'],
+            'age':     batch['response_age'],
+            'gender':  batch['response_gender'],
+            'timbre':  batch['response_timbre'],
+            # 'profile': batch['response_profile'] # summurize age/gender/timbre
+            # emotion/timbre를 묶어서 집중 처리하면 좋을 듯
         }
 
-        loss_emp = out.loss
-        L = (loss_emp
-             + cfg.alpha*loss_ccl(C_s, C_v, C_s_gold, C_v_gold)
+        # TO-DO: loss dtype matching
+        L = (cfg.alpha*loss_ccl(C_s, C_v, C_s_gold, C_v_gold)
              + cfg.beta*(loss_sal(S_s, S_v, S_s_gold, S_v_gold) + loss_cls(logits, labels))
              + cfg.kld_weight*(kld_cs + kld_sd))
-        optim.zero_grad(set_to_none=True); L.backward(); optim.step()
+        optim.zero_grad(set_to_none=True);
+        L.backward();
+        optim.step()
         step+=1
 
         if step % cfg.log_every==0: print(f"[S4] step {step} L_total={L.item():.4f}  L_emp={loss_emp.item():.4f}")
@@ -148,12 +183,12 @@ def main(**args):
         if step % cfg.save_every==0:
             torch.save(cs.state_dict(), os.path.join(ckpt_dir, f'cs_{step}-step.pt'))
             torch.save(sd.state_dict(), os.path.join(ckpt_dir, f'sd_{step}-step.pt'))
-            llm.save_pretrained(os.path.join(ckpt_dir, f'lora_{step}-step'))
+            # llm.save_pretrained(os.path.join(ckpt_dir, f'lora_{step}-step'))
         if step>=cfg.max_steps_s4: break
 
     torch.save(cs.state_dict(), os.path.join(ckpt_dir, f'cs_{step}-step.pt'))
     torch.save(sd.state_dict(), os.path.join(ckpt_dir, f'sd_{step}-step.pt'))
-    llm.save_pretrained(os.path.join(cfg.out_dir, f'lora_{step}-step'))
+    # llm.save_pretrained(os.path.join(cfg.out_dir, f'lora_{step}-step'))
 
 if __name__=='__main__':
     args = parser_args()

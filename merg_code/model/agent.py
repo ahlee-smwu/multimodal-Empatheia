@@ -19,8 +19,8 @@ class DeepSpeedAgent:
 
 
         if self.args['mode']: # org: test mode
-            # self.load_parameters(os.path.join(self.args['save_path'], str(self.args['epochs'])))
-            self.load_parameters(os.path.join('ckpt/merg_ckpt/1'))
+            self.load_parameters(os.path.join(self.args['ckpt_path']))
+            # self.load_parameters(os.path.join('ckpt/merg_ckpt/10000'))
 
         # load config parameters of deepspeed
         ds_params = json.load(open(self.args['ds_config_path']))
