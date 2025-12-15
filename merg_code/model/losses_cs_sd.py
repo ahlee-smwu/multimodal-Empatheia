@@ -63,6 +63,14 @@ def loss_cls(logits, labels):
     for key in ["emotion", "age", "gender", "tone"]:
         if key not in logits or key not in labels:
             continue
-        total = total + _safe_ce_cpu(key, logits[key], labels[key])
+
+        # label이 list 형태라면 tensor로 변환
+        target = labels[key]
+        if isinstance(target, list):
+            target = torch.tensor(target, dtype=torch.long, device=logits[key].device)
+        else:
+            target = target.to(dtype=torch.long, device=logits[key].device)
+
+        total = total + F.cross_entropy(logits[key], target)
 
     return total

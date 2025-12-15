@@ -112,8 +112,8 @@ def main(**args):
          'response_gender': [0],
          'response_timbre': [2],
          'response_profile': [14],
-         'response_audio': [None],
-         'response_video': [None]} '''
+         'response_audio': [/mnt~ path],
+         'response_video': [/mnt~ path]} '''
 
         '''MLLM(AvaMERG) model'''
         outputs, inputs_embeds, input_ids, target_ids, attention_mask = agent.return_output(batch)
@@ -152,13 +152,20 @@ def main(**args):
         S_s_gold = sty.style_from_audio(response_aud).reshape(-1, 192).to(device) # (B,192)
         S_v_gold = torch.zeros(1, 768).to(device) #drm.style_from_video(response_vid).to(device)
 
-        # 여기까지 끝냄 이제 loss만 보면 됨
+        def normalize_label(x, device):
+            if isinstance(x, torch.Tensor):
+                x = x.to(device)
+                x = x.view(-1)
+                return x.long()
+            if isinstance(x, list):
+                return torch.tensor(x, device=device, dtype=torch.long).view(-1)
+            return torch.tensor([x], device=device, dtype=torch.long)
 
         labels = {
-            'emotion': batch['response_emotion'],
-            'age':     batch['response_age'],
-            'gender':  batch['response_gender'],
-            'timbre':  batch['response_timbre'],
+            'emotion': normalize_label(batch['response_emotion'], device),
+            'age': normalize_label(batch['response_age'], device),
+            'gender': normalize_label(batch['response_gender'], device),
+            'tone': normalize_label(batch['response_timbre'], device)
             # 'profile': batch['response_profile'] # summurize age/gender/timbre
             # emotion/timbre를 묶어서 집중 처리하면 좋을 듯
         }

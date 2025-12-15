@@ -253,10 +253,10 @@ class StyleDisentangler(nn.Module):
         E_global = 0.5 * (E_s + E_v)  # fuse E_s, E_v
         P_global = 0.5 * (P_s + P_v)  # fuse P_s, P_v
         logits = {
-            'emotion': self.cls_emotion(E_global).softmax(dim=-1).argmax(dim=-1),
-            'age': self.cls_age(P_global).softmax(dim=-1).argmax(dim=-1),
-            'gender': self.cls_gender(P_global).softmax(dim=-1).argmax(dim=-1),
-            'timbre': self.cls_tone(P_global).softmax(dim=-1).argmax(dim=-1) # tone = timbre
+            'emotion': self.cls_emotion(E_global),
+            'age': self.cls_age(P_global),
+            'gender': self.cls_gender(P_global),
+            'tone': self.cls_tone(P_global) # tone = timbre
         }
 
         # 6. KLD loss (training에서만 사용)
