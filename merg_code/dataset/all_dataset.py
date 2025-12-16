@@ -10,13 +10,16 @@ from tqdm import tqdm
 import pandas as pd
 import glob
 
+
 def transform_conv_id(id):
     return re.sub(r'^0+', '', id)
 
-def calculate_pad_mask(style_clip,dim):
+
+def calculate_pad_mask(style_clip, dim):
     is_padding = (style_clip == 0).all(dim=dim)
     mask = is_padding
     return mask
+
 
 class TextCleaner:
     # IPA Phonemizer: https://github.com/bootphon/phonemizer
@@ -32,6 +35,7 @@ class TextCleaner:
             dicts[symbols[i]] = i
         self.word_index_dictionary = dicts
         print(len(dicts))
+
     def __call__(self, text):
         indexes = []
         for char in text:
@@ -48,8 +52,8 @@ class multimodal_empathetic_dialogue(Dataset):
         self.args = args
         # ★ ADD THIS BLOCK RIGHT HERE
         models_cfg = args.get('models', {})
-        self.audio_path = models_cfg.get('audio_path', None)
-        self.video_path = models_cfg.get('video_path', None)
+        self.audio_path = self.args.get('audio_path', None)
+        self.video_path = self.args.get('video_path', None)
         # ★ END NEW BLOCK
         self.age_projection = {
             "child": 0,
@@ -72,7 +76,7 @@ class multimodal_empathetic_dialogue(Dataset):
         label = 0
         for age in self.age_projection.keys():
             for gender in self.gender_projection.keys():
-                for  timbre in self.timbre_projection.keys():
+                for timbre in self.timbre_projection.keys():
                     combination = f"{age}_{gender}_{timbre}"
                     combinations.append(combination)
                     self.profile_projection[combination] = label
@@ -153,27 +157,27 @@ class multimodal_empathetic_dialogue(Dataset):
             'trusting': 'happy',
             'ashamed': 'sad',
             'apprehensive': 'fear',
-            'faithful': 'happy'       
+            'faithful': 'happy'
         }
 
         self.emotion_projection = {
-            "happy":0,
-            "surprised":1,
-            "angry":2,
-            "fear":3,
-            "sad":4,
-            "disgusted":5,
-            "contempt":6
+            "happy": 0,
+            "surprised": 1,
+            "angry": 2,
+            "fear": 3,
+            "sad": 4,
+            "disgusted": 5,
+            "contempt": 6
         }
 
         self.data = []
-        with open(os.path.join(args['models']['data_path'], args['mode']+'.json'), 'r', encoding='utf-8') as f:
+        with open(os.path.join(args['models']['data_path'], args['mode'] + '.json'), 'r', encoding='utf-8') as f:
             self.raw_data = json.load(f)
 
-        self.audio_path = args['models'].get('audio_path', None)
-        self.video_path = args['models'].get('video_path', None)
+        # self.audio_path = args['models'].get('audio_path', None)
+        # self.video_path = args['models'].get('video_path', None)
 
-        if args['mode']=='train':
+        if args['mode'] == 'train':
             for item in tqdm(self.raw_data, total=len(self.raw_data)):
                 turn = item['turns'][-1]
                 conversation_id = item['conversation_id']
@@ -187,7 +191,7 @@ class multimodal_empathetic_dialogue(Dataset):
                     'listener_profile': listener_profile,
                     'topic': topic,
                 })
-        else: #test
+        else:  # test
             for item in tqdm(self.raw_data, total=len(self.raw_data)):
                 if item['turns']:
                     turn = item['turns'][-1]
@@ -213,7 +217,6 @@ class multimodal_empathetic_dialogue(Dataset):
                                 'turn': turn,
                             })
 
-
     def __len__(self):
         return len(self.data)
 
@@ -221,6 +224,8 @@ class multimodal_empathetic_dialogue(Dataset):
         item = self.data[idx]
         dia_id = transform_conv_id(item['conversation_id'])
         length = len(item['turn']['dialogue_history'])
+        self.audio_path = self.args.get('audio_path', None)
+        self.video_path = self.args.get('video_path', None)
 
         response_utt_name = f'dia{dia_id}utt{length}'
         response_audio = None
@@ -245,14 +250,16 @@ class multimodal_empathetic_dialogue(Dataset):
             # 'response_emotion': self.emotion_projection[item['turn']['chain_of_empathy'].get('speaker_emotion', '')],
             'response_emotion': [emotion],
             'response_age': self.age_projection[item['listener_profile']['age']],
-            'response_gender':self.gender_projection[item['listener_profile']['gender']],
-            'response_timbre':self.timbre_projection[item['listener_profile']['timbre']],
-            'profile_id':self.profile_projection[item['listener_profile']['age'] + '_' + item['listener_profile']['gender'] + '_' + item['listener_profile']['timbre']],
+            'response_gender': self.gender_projection[item['listener_profile']['gender']],
+            'response_timbre': self.timbre_projection[item['listener_profile']['timbre']],
+            'profile_id': self.profile_projection[
+                item['listener_profile']['age'] + '_' + item['listener_profile']['gender'] + '_' +
+                item['listener_profile']['timbre']],
             # ★ NEW: raw tensors that Stage3 SAL will use
             'response_audio': response_audio,  # torch.Tensor or None
             'response_video': response_video,  # torch.Tensor or None
         }
-        return data  
+        return data
 
     def load_tensor(self, path, response_utt_name):
         file_path = os.path.join(path, f"{response_utt_name}.pt")
@@ -264,8 +271,8 @@ class multimodal_empathetic_dialogue(Dataset):
             return tensor_data
         except Exception as e:
             print(f"Error loading {file_path}: {e}")
-            return None 
-    
+            return None
+
     def collate_fn(self, batch):
         conversations = []
         dia_ids = [instance['dia_id'] for instance in batch]
@@ -286,14 +293,14 @@ class multimodal_empathetic_dialogue(Dataset):
         for index in range(len(dia_ids)):
             conversations.append(
                 {
-                    'dialogue_history':dialogue_history[index], 
-                    'response':response[index],
-                    'coe':coe[index]
+                    'dialogue_history': dialogue_history[index],
+                    'response': response[index],
+                    'coe': coe[index]
                 }
             )
 
-        return {'dia_ids':dia_ids, 
-                'conversations':conversations, 
+        return {'dia_ids': dia_ids,
+                'conversations': conversations,
                 'response_age': response_age,
                 'response_emotion': response_emotion,
                 'response_gender': response_gender,
@@ -303,7 +310,7 @@ class multimodal_empathetic_dialogue(Dataset):
                 'response_audio': response_audio,
                 'response_video': response_video,
                 }
-    
+
 
 ''' print(batch)
 {'dia_ids': ['17677'],

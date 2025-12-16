@@ -12,6 +12,10 @@ from model.dreamtalk_wrap import DreamTalkEncoders
 from model.losses_cs_sd import loss_ccl, loss_sal, loss_cls
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, TaskType
+import torchaudio
+import decord
+import numpy as np
+
 
 
 def parser_args():
@@ -38,6 +42,76 @@ def initialize_distributed(args):
     device = args['local_rank'] % torch.cuda.device_count()
     torch.cuda.set_device(device)
     deepspeed.init_distributed(dist_backend='nccl')
+def load_wav_batch(path_list, device):
+    """
+    path_list: list of str (wav paths)
+    returns: [B, T_max] float32 mono, or None if something fails
+    """
+    wavs = []
+    for p in path_list:
+        if p is None:
+            continue
+        try:
+            w, sr = torchaudio.load(p)  # [C, T]
+        except Exception as e:
+            print(f"[WARN] failed to load wav {p}: {e}")
+            return None
+        if w.dim() == 2:      # [C, T] -> mono
+            w = w.mean(0)     # [T]
+        wavs.append(w)
+
+    if len(wavs) == 0:
+        return None
+
+    wavs = torch.nn.utils.rnn.pad_sequence(wavs, batch_first=True)  # [B, T_max]
+    return wavs.to(device)
+
+def load_video_batch(path_list, device, num_frames=8):
+    """
+    path_list: list of str (video paths)
+    returns: [B, T, C, H, W] float32 in [0,1], or None on failure
+    """
+    vids = []
+    for p in path_list:
+        if p is None:
+            continue
+        try:
+            vr = decord.VideoReader(p)
+        except Exception as e:
+            print(f"[WARN] failed to load video {p}: {e}")
+            return None
+        if len(vr) == 0:
+            print(f"[WARN] empty video {p}")
+            return None
+
+        idx = np.linspace(0, len(vr) - 1, num_frames).astype(int)
+        batch = vr.get_batch(idx)  # could be decord NDArray or torch.Tensor
+
+        # --- FIX HERE ---
+        if isinstance(batch, torch.Tensor):
+            # decord torch bridge: already a tensor [T, H, W, C]
+            f = batch.detach().cpu()
+        else:
+            # standard decord NDArray: use asnumpy()
+            f = torch.from_numpy(batch.asnumpy())
+        # ----------------
+
+        # [T, H, W, C] -> [T, C, H, W], float32
+        f = f.permute(0, 3, 1, 2).float()
+        vids.append(f)
+
+    if len(vids) == 0:
+        return None
+
+    T_max = max(v.shape[0] for v in vids)
+    B = len(vids)
+    C, H, W = vids[0].shape[1:]
+    out = torch.zeros(B, T_max, C, H, W)
+    for i, v in enumerate(vids):
+        T = v.shape[0]
+        out[i, :T] = v
+
+    return out.to(device)
 
 def main(**args):
     '''config'''
@@ -76,128 +150,121 @@ def main(**args):
     )
     '''Generator encoder module'''
     sty = StyleTTS2Encoders(cfg.styletts2_ckpt_dir).to(device)
-    drm = sty
+    drm = DreamTalkEncoders(cfg.dreamtalk_ckpt_dir, d_out=cfg.d_out).to(device)
     # drm = DreamTalkEncoders(cfg.dreamtalk_ckpt_dir).to(device)
+    for m in [sty, drm]:
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad_(False)
+    # ---------- training loop ----------
+    step = 0
+    agent.ds_engine.eval()  # LLM frozen
+    cs.train()
+    sd.train()
 
-    '''train loop'''
-    step=0
-    agent.ds_engine.eval() # frozen
-    cs.train(); sd.train()
+    # we’ll reuse one base ckpt_dir for the whole run
+    now = datetime.datetime.now()
+    base_dir = os.path.join(cfg.out_dir, now.strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(base_dir, exist_ok=True)
+    print(f"Base output directory: {base_dir}")
 
+    def normalize_label(x, device):
+        if isinstance(x, torch.Tensor):
+            x = x.to(device)
+            x = x.view(-1)
+            return x.long()
+        if isinstance(x, list):
+            return torch.tensor(x, device=device, dtype=torch.long).view(-1)
+        return torch.tensor([x], device=device, dtype=torch.long)
     for batch in train_iter:
-        ''' # batch content
-        {'dia_ids': ['17677'],
-         'conversations': [{'dialogue_history': [{'index': 0,
-                                                  'role': 'speaker',
-                                                  'utterance': "I just feel like I'm constantly juggling everything and it's wearing me down."},
-                                                 {'index': 1,
-                                                  'role': 'listener',
-                                                  'utterance': 'That sounds really tough. It must be exhausting to manage so much all at once.'},
-                                                 {'index': 2,
-                                                  'role': 'speaker',
-                                                  'utterance': "It's like no matter how hard I try, I can't seem to find a balance."},
-                                                 {'index': 3,
-                                                  'role': 'listener',
-                                                  'utterance': 'Finding that balance can be really challenging, especially with so many expectations.'},
-                                                 {'index': 4,
-                                                  'role': 'speaker',
-                                                  'utterance': "I just wish I could catch a break and feel like I'm on top of things again."}],
-                            'response': "Everyone has moments like these, and it's okay to ask for help when you need it.",
-                            'coe': {'speaker_emotion': 'anxious',
-                                    'event_scenario': 'Feeling the need for a break',
-                                    'emotion_cause': 'The pressure of managing responsibilities without relief',
-                                    'goal_to_response': 'To find reassurance that seeking help is acceptable'}}],
-         'response_age': [2],
-         'response_emotion': [4],
-         'response_gender': [0],
-         'response_timbre': [2],
-         'response_profile': [14],
-         'response_audio': [/mnt~ path],
-         'response_video': [/mnt~ path]} '''
+        # ---------------- MLLM forward (FROZEN) ----------------
+        with torch.no_grad():
+            outputs, inputs_embeds, input_ids, target_ids, attention_mask = agent.return_output(batch)
+            hs = outputs.hidden_states[-1].float()  # [B, T, d_in] in fp32
+            loss_emp = outputs.loss.detach().float()  # scalar fp32, no grad
 
-        '''MLLM(AvaMERG) model'''
-        outputs, inputs_embeds, input_ids, target_ids, attention_mask = agent.return_output(batch)
-
-        hs = outputs.hidden_states[-1]
         r_t, r_s, r_v = hs, hs, hs
 
-        '''CS/SD Modules'''
-        C_s, C_v, kld_cs = cs(r_t.to(device))  # (B,768)
-        S_s, S_v, logits, kld_sd = sd(r_s.to(device), r_v.to(device))  # (B,192), (B,768)
+        # ---------------- CS / SD ----------------
+        C_s, C_v, kld_cs = cs(r_t.to(device))
+        S_s, S_v, logits, kld_sd = sd(r_s.to(device), r_v.to(device))
 
-        # torch.save(r_t, "merg_code/model/cs_sd_tensor/r_t.pt")
-        # torch.save(r_s, "merg_code/model/cs_sd_tensor/r_s.pt")
-        # torch.save(r_v, "merg_code/model/cs_sd_tensor/r_v.pt")
-        # torch.save(C_s, "merg_code/model/cs_sd_tensor/C_s.pt")
-        # torch.save(C_v, "merg_code/model/cs_sd_tensor/C_v.pt")
-        # torch.save(kld_cs, "merg_code/model/cs_sd_tensor/kld_cs.pt")
-        # torch.save(S_s, "merg_code/model/cs_sd_tensor/S_s.pt")
-        # torch.save(S_v, "merg_code/model/cs_sd_tensor/S_v.pt")
-        # torch.save(logits, "merg_code/model/cs_sd_tensor/logits.pt")
-        # torch.save(kld_sd, "merg_code/model/cs_sd_tensor/kld_sd.pt")
+        # ensure KLDs are floats
+        kld_cs = kld_cs.float()
+        kld_sd = kld_sd.float()
 
-        '''Generator encoder module'''
-        # 데이터셋의 audio/video를 바로 넣어야 generator에 encoding 해야 함
+        # ---------------- Gold encoders ----------------
+        responses = [conv["response"] for conv in batch["conversations"]]
+        C_s_gold = sty.text_content(responses).to(device).float()  # (B, d_out)
 
-        response = [conv["response"] for conv in batch["conversations"]]
-        response_aud = [item for sublist in batch["response_audio"] for item in sublist]
-        response_vid = [item for sublist in batch["response_video"] for item in sublist]
-        if (response_vid is None or len(response_vid) == 0 or
-            response_aud is None or len(response_aud) == 0
-        ):
+        response_aud_paths = [p for sub in batch["response_audio"] for p in sub]
+        response_vid_paths = [p for sub in batch["response_video"] for p in sub]
+
+        if (response_aud_paths is None or len(response_aud_paths) == 0 or
+                response_vid_paths is None or len(response_vid_paths) == 0):
             continue
 
-        C_s_gold = sty.text_content(response).to(device)  # (B, 768)
-        C_v_gold = torch.zeros(1, 768).to(device) #drm.content_from_audio(response_aud).to(device)
-        S_s_gold = sty.style_from_audio(response_aud).reshape(-1, 192).to(device) # (B,192)
-        S_v_gold = torch.zeros(1, 768).to(device) #drm.style_from_video(response_vid).to(device)
+        wav_batch = load_wav_batch(response_aud_paths, device)  # [B, T]
+        vid_batch = load_video_batch(response_vid_paths, device)  # [B, T, C, H, W]
 
-        def normalize_label(x, device):
-            if isinstance(x, torch.Tensor):
-                x = x.to(device)
-                x = x.view(-1)
-                return x.long()
-            if isinstance(x, list):
-                return torch.tensor(x, device=device, dtype=torch.long).view(-1)
-            return torch.tensor([x], device=device, dtype=torch.long)
+        if wav_batch is None or vid_batch is None:
+            continue
 
+        C_v_gold = drm.content_from_audio(wav_batch).float()  # (B, d_out)
+        S_s_gold = sty.style_from_audio(response_aud_paths).reshape(-1, 192).to(device).float()
+        S_v_gold = drm.style_from_video(vid_batch).float()  # (B, d_out)
+
+        # ---------------- labels for L_cls ----------------
         labels = {
             'emotion': normalize_label(batch['response_emotion'], device),
             'age': normalize_label(batch['response_age'], device),
             'gender': normalize_label(batch['response_gender'], device),
-            'tone': normalize_label(batch['response_timbre'], device)
-            # 'profile': batch['response_profile'] # summurize age/gender/timbre
-            # emotion/timbre를 묶어서 집중 처리하면 좋을 듯
+            'tone': normalize_label(batch['response_timbre'], device),
         }
 
-        # TO-DO: loss dtype matching
-        L = (cfg.alpha*loss_ccl(C_s, C_v, C_s_gold, C_v_gold)
-             + cfg.beta*(loss_sal(S_s, S_v, S_s_gold, S_v_gold) + loss_cls(logits, labels))
-             + cfg.kld_weight*(kld_cs + kld_sd))
-        optim.zero_grad(set_to_none=True);
-        L.backward();
+        # ---------------- individual loss terms (in fp32) ----------------
+        L_ccl = loss_ccl(C_s, C_v, C_s_gold, C_v_gold).float()
+        L_sal = loss_sal(S_s, S_v, S_s_gold, S_v_gold).float()
+        L_cls = loss_cls(logits, labels).float()
+
+        # loss used for *training* (only cs/sd / gold paths)
+        L_train = (
+                cfg.alpha * L_ccl
+                + cfg.beta * (L_sal + L_cls)
+                + cfg.kld_weight * (kld_cs + kld_sd)
+        )
+
+        # loss used for logging: include empathy loss
+        L_total = loss_emp + L_train
+
+        optim.zero_grad(set_to_none=True)
+        L_train.backward()  # <--- ONLY backprop through your modules
         optim.step()
-        step+=1
+        step += 1
 
-        if step % cfg.log_every==0: print(f"[S4] step {step} L_total={L.item():.4f}  L_emp={loss_emp.item():.4f}")
+        if step % cfg.log_every == 0:
+            print(f"[S4] step {step}  L_total={L_total.item():.4f}  "
+                  f"L_emp={loss_emp.item():.4f}")
 
-        '''save ckpt'''
-        now = datetime.datetime.now()
-        date_str = now.strftime("%Y%m%d_%H%M%S")  # 예: 20251202_131800
-        ckpt_dir = os.path.join(cfg.out_dir, date_str)
-        os.makedirs(ckpt_dir, exist_ok=True)
-        print(f"Output directory: {ckpt_dir}")
-        if step % cfg.save_every==0:
+        if step % cfg.save_every == 0:
+            ckpt_dir = os.path.join(base_dir, f"step_{step}")
+            os.makedirs(ckpt_dir, exist_ok=True)
             torch.save(cs.state_dict(), os.path.join(ckpt_dir, f'cs_{step}-step.pt'))
             torch.save(sd.state_dict(), os.path.join(ckpt_dir, f'sd_{step}-step.pt'))
-            # llm.save_pretrained(os.path.join(ckpt_dir, f'lora_{step}-step'))
-        if step>=cfg.max_steps_s4: break
 
+        if step >= cfg.max_steps_s4:
+            break
+
+        # final save
+    ckpt_dir = os.path.join(base_dir, f"final_{step}")
+    os.makedirs(ckpt_dir, exist_ok=True)
     torch.save(cs.state_dict(), os.path.join(ckpt_dir, f'cs_{step}-step.pt'))
     torch.save(sd.state_dict(), os.path.join(ckpt_dir, f'sd_{step}-step.pt'))
-    # llm.save_pretrained(os.path.join(cfg.out_dir, f'lora_{step}-step'))
 
-if __name__=='__main__':
+
+if __name__ == '__main__':
     args = parser_args()
     args = vars(args)
     main(**args)
+
+
