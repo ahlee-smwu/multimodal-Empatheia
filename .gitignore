@@ -9,3 +9,21 @@ logs/*
 !logs/
 __pycache__/
 *.pyc
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+
+# Logs / outputs
+nohup.out
+*.log
+
+# Big model artifacts / tensors (adjust if you really want them tracked)
+merg_code/StyleTTS2/Utils/PLBERT/*.t7
+merg_code/model/cs_sd_tensor/
+sadtalker/
+
+# Weird accidental folders
+=*/

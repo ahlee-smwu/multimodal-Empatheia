@@ -64,29 +64,34 @@ class DreamTalkEncoders(nn.Module):
         feat = out.last_hidden_state.mean(dim=1)   # [B, H]
         feat = self.audio_proj(feat)               # [B, d_out]
         return feat
-
     @torch.no_grad()
     def style_from_video(self, video_tensor: torch.Tensor) -> torch.Tensor:
         """
         Approximate 'style' embedding from video.
 
         video_tensor:
-          - [B, T, C, H, W]  or
-          - [B, C, T, H, W]  or
-          - [B, C, H, W]
+          - [B, T, C, H, W]  (our main case)
+          - [B, C, T, H, W]  (we'll convert)
+          - [B, C, H, W]     (single frame)
         returns: [B, d_out]
         """
         v = video_tensor
 
         if v.dim() == 5:
-            # either [B, T, C, H, W] or [B, C, T, H, W]
-            if v.size(2) == 3:  # [B, C, T, H, W]
-                B, C, T, H, W = v.shape
-                v = v.permute(0, 2, 1, 3, 4)  # -> [B, T, C, H, W]
-            else:  # [B, T, C, H, W]
+            # Prefer to treat input as [B, T, C, H, W]
+            if v.size(2) == 3:
+                # [B, T, C, H, W]
                 B, T, C, H, W = v.shape
+            elif v.size(1) == 3:
+                # [B, C, T, H, W] -> [B, T, C, H, W]
+                v = v.permute(0, 2, 1, 3, 4).contiguous()
+                B, T, C, H, W = v.shape
+            else:
+                raise ValueError(f"Cannot infer channel dim from video shape {v.shape}")
 
-            v = v.reshape(B * T, C, H, W)  # [B*T, C, H, W]
+            # flatten time into batch for ResNet
+            v = v.reshape(B * T, C, H, W)
+
         elif v.dim() == 4:
             # [B, C, H, W]
             B, C, H, W = v.shape
@@ -104,12 +109,12 @@ class DreamTalkEncoders(nn.Module):
         # resize to 224x224 for ResNet
         v = F.interpolate(v, size=(224, 224), mode="bilinear", align_corners=False)
 
-        # ImageNet normalization
+        # ImageNet normalization (per-channel)
         mean = v.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        std = v.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        std  = v.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         v = (v - mean) / std
 
         feat = self.video_backbone(v)          # [B*T, 512]
-        feat = feat.view(B, T, -1).mean(1)     # [B, 512]
+        feat = feat.view(B, T, -1).mean(1)     # [B, 512] (temporal average)
         feat = self.video_proj(feat)           # [B, d_out]
         return feat
