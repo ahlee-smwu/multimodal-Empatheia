@@ -13,7 +13,7 @@ alpha: 0.3
 beta: 0.3
 kld_weight: 1.0e-4
 
-lr: 2.0e-4
+lr: 5.0e-5 # 2.0e-4
 weight_decay: 0.01
 batch_size: 4
 num_workers: 4
@@ -21,9 +21,9 @@ num_workers: 4
 max_steps_s1: 1000
 max_steps_s2: 2000
 max_steps_s3: 2000
-max_steps_s4: 2000
+max_steps_s4: 1000000
 log_every: 50
-save_every: 500
+save_every: 1000
 
 llm_model_name: lmsys/vicuna-7b-v1.5
 lora_r: 16
@@ -31,7 +31,7 @@ lora_alpha: 32
 lora_dropout: 0.05
 max_len: 1024
 
-styletts2_ckpt_dir: "/home/a6000/bk-project/multimodal-Empatheia/ckpt/pretrained_ckpt/styletts2_encoders"
+styletts2_ckpt_dir: "ckpt/pretrained_ckpt/styletts2_encoders"
 dreamtalk_ckpt_dir: "ckpt/dreamtalk_encoders"
 
-out_dir: "/home/a6000/bk-project/multimodal-Empatheia/ckpt/merg-total_ckpt"
+out_dir: "ckpt/merg-total_ckpt"

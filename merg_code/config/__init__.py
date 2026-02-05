@@ -1,7 +1,7 @@
 import yaml
 
 def load_config(args):
-    base_config_path = f'/home/a6000/bk-project/multimodal-Empatheia/merg_code/config/base.yaml'
+    base_config_path = f'merg_code/config/base.yaml'
     with open(base_config_path) as f:
         base_config = yaml.load(f, Loader=yaml.FullLoader)
     args = args.copy() if hasattr(args, 'copy') else dict(args)
