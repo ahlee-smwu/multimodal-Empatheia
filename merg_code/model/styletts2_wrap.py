@@ -12,6 +12,9 @@ sys.path.append('merg_code/StyleTTS2')
 
 from StyleTTS2.Utils.PLBERT.util import load_plbert
 from StyleTTS2.Utils.JDC.model import JDCNet
+from StyleTTS2.models import ProsodyPredictor
+from StyleTTS2.Modules.hifigan import Generator, Decoder
+from StyleTTS2.models import build_model
 
 
 class PLBERTWrapper(nn.Module):
@@ -262,8 +265,71 @@ class StyleTTS2Encoders(nn.Module):
         # ★ F0_real 그대로 사용 (이미 평균된 상태)
         return F0_real  # (B, C) 형태로 나옴
 
+class StyleTTS2Decoders(nn.Module):
+    """
+    CS / SD output을 직접 받아 StyleTTS2 hifigan Decoder로 waveform 생성
+    - TextEncoder ❌
+    - StyleEncoder ❌
+    - ProsodyPredictor ❌
+    """
+
+    def __init__(self, styletts2_ckpt_path, device="cuda"):
+        """
+        styletts2_ckpt_path:
+            StyleTTS2 pretrained checkpoint (.pth / .pt)
+            내부에 'decoder', 'model_params.decoder'가 있어야 함
+        """
+        super().__init__()
+        self.device = device
+
+        ckpt = torch.load(styletts2_ckpt_path, map_location="cpu")
+
+        # StyleTTS2 hifigan Decoder
+        self.decoder = Decoder(**ckpt["model_params"]["decoder"])
+        self.decoder.load_state_dict(ckpt["decoder"])
+        self.decoder.to(device).eval()
+
+    @torch.no_grad()
+    def forward(self, C_s, S_s, F0=None, N=None):
+        """
+        Args:
+            C_s: (B, C, T)    ← CS output (frame-level content)
+            S_s: (B, D)       ← SD output (style embedding)
+            F0:  (B, T) or None
+            N:   (B, T) or None
+
+        Returns:
+            wav: (B, 1, T_audio)
+        """
+        C_s = C_s.to(self.device)
+        S_s = S_s.to(self.device)
+
+        B, _, T = C_s.shape
+
+        # StyleTTS2는 F0 / N 필수 → 없으면 0으로 대체
+        if F0 is None:
+            F0 = torch.zeros(B, T, device=self.device)
+        else:
+            F0 = F0.to(self.device)
+
+        if N is None:
+            N = torch.zeros(B, T, device=self.device)
+        else:
+            N = N.to(self.device)
+
+        # hifigan Decoder
+        wav = self.decoder(
+            asr=C_s,
+            F0_curve=F0,
+            N=N,
+            s=S_s
+        )
+
+        return wav
+
 
 if __name__=='__main__':
+    # test code
     sty = StyleTTS2Encoders('/home/a6000/bk-project/multimodal-Empatheia/ckpt/pretrained_ckpt/styletts2_encoders')
     S_s_gold = sty.style_from_audio('/mnt/dataset/AvaMERG_jhchoi/AvaMERG/audio_v5_0/dia14724utt3_18.wav')
     print(f"S_s_gold shape: {S_s_gold.shape}")  # (1, C)

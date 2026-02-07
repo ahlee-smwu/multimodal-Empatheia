@@ -31,7 +31,7 @@ lora_alpha: 32
 lora_dropout: 0.05
 max_len: 1024
 
-styletts2_ckpt_dir: "ckpt/pretrained_ckpt/styletts2_encoders"
-dreamtalk_ckpt_dir: "ckpt/dreamtalk_encoders"
+#styletts2_ckpt_dir: "ckpt/pretrained_ckpt/styletts2_encoders"
+#dreamtalk_ckpt_dir: "ckpt/dreamtalk_encoders"
 
 out_dir: "ckpt/merg-total_ckpt"

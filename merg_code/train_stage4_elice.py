@@ -24,8 +24,10 @@ def parser_args():
     parser.add_argument('--model', type=str, default='merg')
     parser.add_argument('--mode', type=str, default='train', help='train or test')
     parser.add_argument('--data_path', type=str, default='merg_data')
-    parser.add_argument('--audio_path', type=str, default="/home/elicer/bk/dataset/audio_v5_0")
-    parser.add_argument('--video_path', type=str, default="/home/elicer/bk/dataset/video_v5_0")
+    # parser.add_argument('--audio_path', type=str, default="/home/elicer/bk/dataset/audio_v5_0") # elice
+    parser.add_argument('--audio_path', type=str, default="/mnt/SSD_raid1/AvaMERG/audio_v5_0") # navi
+    # parser.add_argument('--video_path', type=str, default="/home/elicer/bk/dataset/video_v5_0") # elice
+    parser.add_argument('--video_path', type=str, default="/mnt/SSD_raid1/AvaMERG/video_v5_0") # navi
     parser.add_argument('--ckpt_path', type=str, default="ckpt/merg_ckpt/10000")
     parser.add_argument('--local_rank', default=0, type=int)
     parser.add_argument('--save_path', type=str, default='ckpt/merg_ckpt_total/')
@@ -172,7 +174,7 @@ def main(args):
         weight_decay=cfg.weight_decay,
     )
 
-    sty = StyleTTS2Encoders(cfg.styletts2_ckpt_dir).to(device)
+    sty = StyleTTS2Encoders(os.path.join(args.styletts2_ckpt_dir, 'encoders')).to(device)
     drm = DreamTalkEncoders(cfg.dreamtalk_ckpt_dir, d_out=cfg.d_out).to(device)
 
     for m in [sty, drm]:

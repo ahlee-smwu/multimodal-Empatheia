@@ -381,7 +381,7 @@ class MERGModel(nn.Module):
         return loss, gen_acc
 
 
-    def forward(self, inputs):
+    def forward(self, inputs): # 안 씀, forward_llm 씀
         gen_acc = 0
 
         input_ids, target_ids, attention_mask = process_batch_text_stream(self.llama_tokenizer,

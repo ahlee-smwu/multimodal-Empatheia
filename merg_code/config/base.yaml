@@ -13,7 +13,7 @@ models:
   alpha: 0.3
   beta: 0.3
   kld_weight: 0.0001
-  styletts2_ckpt_dir: ckpt/pretrained_ckpt/styletts2_encoders
+  styletts2_ckpt_dir: ckpt/pretrained_ckpt/styletts2_ckpt
   dreamtalk_ckpt_dir: ckpt/dreamtalk_encoders
 seed: 13
 epochs: 30
