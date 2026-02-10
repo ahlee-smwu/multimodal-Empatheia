@@ -7,7 +7,7 @@ import datetime, os
 from config.cs_common import load_cs_config
 from model.cs_sd import ContentSynchronizer, StyleDisentangler
 from model.styletts2_wrap import StyleTTS2Encoders
-from model.dreamtalk_wrap import DreamTalkEncoders
+from model.keyface_wrap import KeyFaceEncoders
 from model.losses_cs_sd import loss_ccl, loss_sal, loss_cls
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, TaskType
@@ -15,7 +15,7 @@ import torchaudio
 import decord
 import numpy as np
 from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter   # ✅ (추가)
+from torch.utils.tensorboard import SummaryWriter
 logging.getLogger().setLevel(logging.ERROR)
 
 
@@ -175,9 +175,9 @@ def main(args):
     )
 
     sty = StyleTTS2Encoders(os.path.join(args.styletts2_ckpt_dir, 'encoders')).to(device)
-    drm = DreamTalkEncoders(cfg.dreamtalk_ckpt_dir, d_out=cfg.d_out).to(device)
+    keyface = KeyFaceEncoders(os.path.join(args.keyface_ckpt_dir, 'keyframe.pt'), d_out=cfg.d_out).to(device)
 
-    for m in [sty, drm]:
+    for m in [sty, keyface]:
         m.eval()
         for p in m.parameters():
             p.requires_grad_(False)
@@ -191,8 +191,7 @@ def main(args):
     base_dir = os.path.join("ckpt/merg-total_ckpt", now.strftime("%Y%m%d_%H%M%S"))
     os.makedirs(base_dir, exist_ok=True)
 
-    # ✅ Namespace 기반으로 정확하게 main rank 판단
-    writer = SummaryWriter(base_dir) if is_main_process else None   # ✅
+    writer = SummaryWriter(base_dir) if is_main_process else None
 
     def normalize_label(x, device):
         if isinstance(x, torch.Tensor):
@@ -234,9 +233,9 @@ def main(args):
             if wav_batch is None or vid_batch is None:
                 continue
 
-            C_v_gold = drm.content_from_audio(wav_batch).float()
+            C_v_gold = keyface.content_from_audio(wav_batch).float()
             S_s_gold = sty.style_from_audio(response_aud_paths).reshape(-1, 192).to(device).float()
-            S_v_gold = drm.style_from_video(vid_batch).float()
+            S_v_gold = keyface.style_from_video(vid_batch).float()
 
             labels = {
                 'emotion': normalize_label(batch['response_emotion'], device),
@@ -269,7 +268,6 @@ def main(args):
                     L_total=f"{(loss_emp + L_train).item():.3f}",
                 )
 
-                # ✅ writer 가 None 이 아니도록 보장된 상태에서 add_scalar 호출
                 writer.add_scalar("loss/L_ccl", L_ccl.item(), step)
                 writer.add_scalar("loss/L_sal_cls", (L_sal + L_cls).item(), step)
                 writer.add_scalar("loss/KLD", (kld_cs + kld_sd).item(), step)

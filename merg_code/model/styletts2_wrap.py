@@ -16,6 +16,27 @@ from StyleTTS2.models import ProsodyPredictor
 from StyleTTS2.Modules.hifigan import Generator, Decoder
 from StyleTTS2.models import build_model
 
+'''
+Text
+ └─ TextEncoder (PL-BERT)
+       ↓
+    Content Representation (C)
+
+Reference Audio
+ └─ StyleEncoder (JDCNet)
+       ↓
+    Style Representation (S)
+
+(C, S)
+ └─ ProsodyPredictor # in .pth weight
+       ↓
+    F0, Energy, Duration
+
+(C, S, F0, N)
+ └─ Decoder (HiFiGAN-based) # in .pth weight
+       ↓
+    Waveform
+'''
 
 class PLBERTWrapper(nn.Module):
     def __init__(self, plbert_dir, device=None):
@@ -161,17 +182,24 @@ class StyleTTS2Encoders(nn.Module):
         self.text_proj.eval().requires_grad_(False)
         self.ref_enc.to(self.device).eval().requires_grad_(False)
 
-    # ------------------ 텍스트 인코더 ------------------
-    @torch.no_grad()
+    # ------------------ 텍스트 인코더 ------------------@torch.no_grad()
     def text_content(self, texts):
         """
-        texts: List[str] 또는 str (Empatheia의 response 텍스트)
-        return: (B, proj_dim)
+        StyleTTS2 TextEncoder output을 모방
+        Args:
+            texts: List[str] or str
+        Returns:
+            C: (B, hidden_dim, T_text)
         """
-        h_text = self.plbert_wrap.encode_texts(texts)  # (B, T, H)
-        h_mean = h_text.mean(dim=1)  # (B, H)
-        h_proj = self.text_proj(h_mean)  # (B, proj_dim)
-        return h_proj
+
+        # PL-BERT token-level output
+        h_text = self.plbert_wrap.encode_texts(texts)   # (B, T, H)
+        # project to StyleTTS2 hidden_dim
+        h_proj = self.text_proj(h_text)                 # (B, T, hidden_dim)
+        # StyleTTS2 TextEncoder output format
+        C = h_proj.transpose(1, 2)                      # (B, hidden_dim, T)
+
+        return C
 
     # ------------------ 오디오 로더 ------------------
     @torch.no_grad()

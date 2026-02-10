@@ -30,14 +30,17 @@ logging.getLogger().setLevel(logging.ERROR)
 def parser_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='merg')
+    parser.add_argument('--ckpt_path', type=str, default="ckpt/merg_ckpt/10000") # merg model ckpt
     parser.add_argument('--ckpt_module', type=str,
                         default='ckpt/merg-total_ckpt/20251229_054450_3ep/6000')
     parser.add_argument('--ckpt_aud', type=str,
-                        default='ckpt/styletts2_ckpt/decoders')
+                        default='ckpt/pretrained_ckpt/styletts2_ckpt/decoders')
     parser.add_argument('--out_dir', type=str, default='output')
-    parser.add_argument('--mode', type=str, default='test')
-    parser.add_argument('--audio_path', type=str, default="/mnt/SSD_raid1/AvaMERG/audio_v5_0")
-    parser.add_argument('--video_path', type=str, default="/mnt/SSD_raid1/AvaMERG/video_v5_0")
+    parser.add_argument('--mode', type=str, default='train') #train #test
+    # parser.add_argument('--audio_path', type=str, default="/mnt/SSD_raid1/AvaMERG/audio_v5_0") # navi
+    parser.add_argument('--audio_path', type=str, default="/mnt/HDD_raid1/AvaMERG_jhchoi/AvaMERG/audio_v5_0") # a6000
+    # parser.add_argument('--video_path', type=str, default="/mnt/SSD_raid1/AvaMERG/video_v5_0") # navi
+    parser.add_argument('--video_path', type=str, default="/mnt/HDD_raid1/AvaMERG_jhchoi/AvaMERG/video_v5_0") # a6000
     parser.add_argument('--local_rank', default=0, type=int)
     parser.add_argument('--max_length', type=int, default=1024)
     return parser.parse_args()
@@ -104,10 +107,19 @@ def main(args):
     print(f"✅ Loaded SD: {os.path.basename(sd_ckpt)}")
 
     # ------------------ StyleTTS2 (GPU) ------------------
-    sty = StyleTTS2Decoders(
-        styletts2_ckpt_path=os.path.join(args.ckpt_aud, 'epochs_2nd_00020.pth'),
-        device=device
-    ).eval()
+    '''
+    [ Content + Style + F0 + N ]
+            ↓
+    Acoustic Decoder (mel 생성)
+            ↓
+    HiFi-GAN Generator
+            ↓
+          waveform
+    '''
+    # sty = StyleTTS2Decoders(
+    #     styletts2_ckpt_path=os.path.join(args.ckpt_aud, 'epochs_2nd_00020.pth'),
+    #     device=device
+    # ).eval()
 
     # ------------------ MERG forward (GPU) ------------------
     outputs, *_ = agent.return_output(batch)
@@ -116,6 +128,7 @@ def main(args):
     # ------------------ CS / SD ------------------
     C_s, _, _ = cs(hs)
     S_s, _, _, _ = sd(hs, hs)
+    print(f"C_s: {C_s.shape}, S_s: {S_s.shape}")
 
     # ------------------ TTS ------------------
     wav = sty(C_s, S_s)

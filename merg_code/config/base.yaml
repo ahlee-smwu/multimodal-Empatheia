@@ -14,7 +14,7 @@ models:
   beta: 0.3
   kld_weight: 0.0001
   styletts2_ckpt_dir: ckpt/pretrained_ckpt/styletts2_ckpt
-  dreamtalk_ckpt_dir: ckpt/dreamtalk_encoders
+  keyface_ckpt_dir: ckpt/pretrained_ckpt/keyface_ckpt
 seed: 13
 epochs: 30
 warmup_rate: 0.1
