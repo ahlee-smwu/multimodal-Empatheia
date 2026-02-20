@@ -32,7 +32,7 @@ def parser_args():
     parser.add_argument('--model', type=str, default='merg')
     parser.add_argument('--ckpt_path', type=str, default="ckpt/merg_ckpt/10000") # merg model ckpt
     parser.add_argument('--ckpt_module', type=str,
-                        default='ckpt/merg-total_ckpt/20251229_054450_3ep/6000')
+                        default='ckpt/merg-total_ckpt/20260215_001337_3ep/10000')
     parser.add_argument('--ckpt_aud', type=str,
                         default='ckpt/pretrained_ckpt/styletts2_ckpt/decoders')
     parser.add_argument('--out_dir', type=str, default='output')
@@ -131,6 +131,7 @@ def main(args):
     print(f"C_s: {C_s.shape}, S_s: {S_s.shape}")
 
     # ------------------ TTS ------------------
+    sty = StyleTTS2Decoders(args.ckpt_aud)
     wav = sty(C_s, S_s)
 
     # ------------------ save ------------------

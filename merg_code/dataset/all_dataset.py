@@ -9,7 +9,8 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import pandas as pd
 import glob
-
+import torchaudio
+import decord
 
 def transform_conv_id(id):
     return re.sub(r'^0+', '', id)
@@ -174,9 +175,6 @@ class multimodal_empathetic_dialogue(Dataset):
         with open(os.path.join(args['models']['data_path'], args['mode'] + '.json'), 'r', encoding='utf-8') as f:
             self.raw_data = json.load(f)
 
-        # self.audio_path = args['models'].get('audio_path', None)
-        # self.video_path = args['models'].get('video_path', None)
-
         if args['mode'] == 'train':
             for item in tqdm(self.raw_data, total=len(self.raw_data)):
                 turn = item['turns'][-1]
@@ -217,6 +215,8 @@ class multimodal_empathetic_dialogue(Dataset):
                                 'turn': turn,
                             })
 
+        self.valid_data = []
+
     def __len__(self):
         return len(self.data)
 
@@ -228,12 +228,43 @@ class multimodal_empathetic_dialogue(Dataset):
         self.video_path = self.args.get('video_path', None)
 
         response_utt_name = f'dia{dia_id}utt{length}'
+
+        # =========================================================
+        # 🔊 AUDIO: path → waveform tensor (T,)
+        # =========================================================
         response_audio = None
-        response_video = None
         if self.audio_path is not None:
-            response_audio = glob.glob(os.path.join(self.audio_path, f"{response_utt_name}_*.wav"))
+            audio_paths = glob.glob(
+                os.path.join(self.audio_path, f"{response_utt_name}_*.wav")
+            )
+            if len(audio_paths) > 0:
+                try:
+                    w, sr = torchaudio.load(audio_paths[0])
+                    if w.dim() == 2:
+                        w = w.mean(0)  # (T,)
+                    response_audio = w  # ❗ pad 안 함
+                except Exception as e:
+                    print(f"[WARN] failed to load wav {audio_paths[0]}: {e}")
+
+        # =========================================================
+        # 🎥 VIDEO: path → frames tensor (T, C, H, W)
+        # =========================================================
+        response_video = None
         if self.video_path is not None:
-            response_video = glob.glob(os.path.join(self.video_path, f"{response_utt_name}_*.mp4"))
+            video_paths = glob.glob(
+                os.path.join(self.video_path, f"{response_utt_name}_*.mp4")
+            )
+            if len(video_paths) > 0:
+                try:
+                    vr = decord.VideoReader(video_paths[0])
+                    if len(vr) > 0:
+                        idxs = np.linspace(0, len(vr) - 1, 8).astype(int)
+                        frames = vr.get_batch(idxs)
+                        frames = torch.from_numpy(frames.asnumpy())
+                        frames = frames.permute(0, 3, 1, 2).float()
+                        response_video = frames  # (T, C, H, W)
+                except Exception as e:
+                    print(f"[WARN] failed to load video {video_paths[0]}: {e}")
 
         emotion = item['turn']['chain_of_empathy'].get('speaker_emotion', [])
         if isinstance(emotion, list):
@@ -256,8 +287,8 @@ class multimodal_empathetic_dialogue(Dataset):
                 item['listener_profile']['age'] + '_' + item['listener_profile']['gender'] + '_' +
                 item['listener_profile']['timbre']],
             # ★ NEW: raw tensors that Stage3 SAL will use
-            'response_audio': response_audio,  # torch.Tensor or None
-            'response_video': response_video,  # torch.Tensor or None
+            'response_audio': response_audio,  # (T,)
+            'response_video': response_video,  # (T, C, H, W)
         }
         return data
 
@@ -274,42 +305,81 @@ class multimodal_empathetic_dialogue(Dataset):
             return None
 
     def collate_fn(self, batch):
+        # ============================
+        # ❗ 1. audio & video 둘 다 있는 샘플만 유지
+        # ============================
+        filtered = []
+        for b in batch:
+            if b['response_audio'] is None:
+                continue
+            if b['response_video'] is None:
+                continue
+            filtered.append(b)
+
+        # batch 전체가 날아간 경우
+        if len(filtered) == 0:
+            return None
+
+        batch = filtered
+
+        # ============================
+        # 기본 텍스트 / 라벨
+        # ============================
+        dia_ids = [b['dia_id'] for b in batch]
+        responses = [b['response'] for b in batch]
+        dialogue_history = [b['dialogue_history'] for b in batch]
+        coe = [b['chain_of_empathy'] for b in batch]
+        response_emotion = [b['response_emotion'] for b in batch]
+        response_age = [b['response_age'] for b in batch]
+        response_gender = [b['response_gender'] for b in batch]
+        response_timbre = [b['response_timbre'] for b in batch]
+        response_profile = [b['profile_id'] for b in batch]
+
+        # ============================
+        # 🔊 AUDIO: pad (B, T)
+        # ============================
+        audio_list = [b['response_audio'] for b in batch]
+        audio_batch = torch.nn.utils.rnn.pad_sequence(
+            audio_list,
+            batch_first=True
+        )
+
+        # ============================
+        # 🎥 VIDEO: pad (B, T, C, H, W)
+        # ============================
+        video_list = [b['response_video'] for b in batch]
+
+        T_max = max(v.size(0) for v in video_list)
+        B = len(video_list)
+        C, H, W = video_list[0].shape[1:]
+
+        video_batch = torch.zeros(B, T_max, C, H, W, dtype=video_list[0].dtype)
+        for i, v in enumerate(video_list):
+            T = v.size(0)
+            video_batch[i, :T] = v
+
+        # ============================
+        # conversations 포맷 유지
+        # ============================
         conversations = []
-        dia_ids = [instance['dia_id'] for instance in batch]
-        response_age = [instance['response_age'] for instance in batch]
-        response_gender = [instance['response_gender'] for instance in batch]
-        response_timbre = [instance['response_timbre'] for instance in batch]
-        response_emotion = [instance['response_emotion'] for instance in batch]
-        response_profile = [instance['profile_id'] for instance in batch]
-        # ★ NEW: collect wav & video
-        response_audio = [instance['response_audio'] for instance in batch]
-        response_video = [instance['response_video'] for instance in batch]
+        for i in range(len(batch)):
+            conversations.append({
+                'dialogue_history': dialogue_history[i],
+                'response': responses[i],
+                'coe': coe[i],
+            })
 
-        dialogue_history = [instance['dialogue_history'] for instance in batch]
-        response = [instance['response'] for instance in batch]
-        coe = [instance['chain_of_empathy'] for instance in batch]
-        # profile_ids = [instance['profile_id'] for instance in batch]
-        assert len(dia_ids) == len(dialogue_history) == len(response) == len(coe)
-        for index in range(len(dia_ids)):
-            conversations.append(
-                {
-                    'dialogue_history': dialogue_history[index],
-                    'response': response[index],
-                    'coe': coe[index]
-                }
-            )
-
-        return {'dia_ids': dia_ids,
-                'conversations': conversations,
-                'response_age': response_age,
-                'response_emotion': response_emotion,
-                'response_gender': response_gender,
-                'response_timbre': response_timbre,
-                'response_profile': response_profile,
-                # ★ NEW: what Stage3 SAL is screaming for
-                'response_audio': response_audio,
-                'response_video': response_video,
-                }
+        return {
+            'dia_ids': dia_ids,
+            'conversations': conversations,
+            'response_emotion': response_emotion,
+            'response_age': response_age,
+            'response_gender': response_gender,
+            'response_timbre': response_timbre,
+            'response_profile': response_profile,
+            'response_audio': audio_batch,  # (B, T)
+            'response_video': video_batch,  # (B, T, C, H, W)
+        }
 
 
 ''' print(batch)

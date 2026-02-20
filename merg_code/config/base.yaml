@@ -7,14 +7,14 @@ models:
   max_response_length: 512
   logging_step: 50
 
-  freeze_lm: false
+  freeze_lm: true # false
   freeze_input_proj: false
   max_shard_size: 10GB
   alpha: 0.3
   beta: 0.3
   kld_weight: 0.0001
-  styletts2_ckpt_dir: ckpt/pretrained_ckpt/styletts2_ckpt
-  keyface_ckpt_dir: ckpt/pretrained_ckpt/keyface_ckpt
+  styletts2_ckpt_dir: ckpt/pretrained_ckpt/styletts2_ckpt # 안 쓰는 듯
+  keyface_ckpt_dir: ckpt/pretrained_ckpt/keyface_ckpt # 안 쓰는 듯
 seed: 13
 epochs: 30
 warmup_rate: 0.1

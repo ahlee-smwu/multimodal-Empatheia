@@ -256,7 +256,7 @@ def main(**args):
             if step % cfg.save_every == 0 and step > 0:
                 ckpt_dir = os.path.join(base_dir, f"{step}")
                 os.makedirs(ckpt_dir, exist_ok=True)
-        dataset = ImgLatentDataset(output_dir, latent_norm=True)                torch.save(cs.state_dict(), os.path.join(ckpt_dir, f'cs_{step}.pt'))
+                torch.save(cs.state_dict(), os.path.join(ckpt_dir, f'cs_{step}.pt'))
                 torch.save(sd.state_dict(), os.path.join(ckpt_dir, f'sd_{step}.pt'))
                 print(f'Save ckpt at {ckpt_dir}')
 

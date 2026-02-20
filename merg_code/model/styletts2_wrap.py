@@ -18,24 +18,30 @@ from StyleTTS2.models import build_model
 
 '''
 Text
- └─ TextEncoder (PL-BERT)
-       ↓
-    Content Representation (C)
+ └─ TextEncoder(PL-BERT) → C_token (B, H, T_token)
 
-Reference Audio
- └─ StyleEncoder (JDCNet)
-       ↓
-    Style Representation (S)
+Reference
+ └─ StyleEncoder(JDCNet) → S (B, D)
 
-(C, S)
- └─ ProsodyPredictor # in .pth weight
-       ↓
-    F0, Energy, Duration
+(C_token, S)
+ └─ ProsodyPredictor  # in .pth weight
+      ├─ duration (B, T_token)
+      ├─ F0_token (B, T_token)
+      └─ Energy_token (B, T_token)
 
-(C, S, F0, N)
- └─ Decoder (HiFiGAN-based) # in .pth weight
-       ↓
-    Waveform
+      ↓
+
+Length Regulator (duration 기반 확장)
+      ↓
+
+C_frame (B, H, T_frame)
+F0_frame (B, T_frame)
+Energy_frame (B, T_frame)
+
+(C_frame, S, F0_frame, Energy_frame)
+ └─ HiFiGAN Decoder # in .pth weight
+      ↓
+Waveform
 '''
 
 class PLBERTWrapper(nn.Module):
@@ -258,8 +264,10 @@ class StyleTTS2Encoders(nn.Module):
             power=1.0
         ).to(device)
 
+        wav = wav.contiguous()
         mel = mel_transform(wav)  # (B, 80, T')
         mel = torch.log1p(mel)  # 원본 preprocess
+        mel = mel.to(device)
 
         # 길이 192로 맞추기 (seq_len=192)
         B, F, T = mel.shape
@@ -278,79 +286,156 @@ class StyleTTS2Encoders(nn.Module):
     # ------------------ 스타일 추출 ------------------
     @torch.no_grad()
     def style_from_audio(self, wav_inputs):
+        """
+        Args:
+            wav_inputs:
+                - str: single wav path
+                - List[str]: wav paths
+                - Tensor (B, T): waveform batch
+                - Tensor (T,): single waveform
+        Returns:
+            F0_real: (B, C)
+        """
+
+        # -------------------------
+        # 1. path 입력
+        # -------------------------
         if isinstance(wav_inputs, str):
-            wav_inputs = [wav_inputs]
-        if isinstance(wav_inputs, (list, tuple)):
+            wav_batch = self._paths_to_batch([wav_inputs])
+
+        elif isinstance(wav_inputs, list) and isinstance(wav_inputs[0], str):
             wav_batch = self._paths_to_batch(wav_inputs)
+        # -------------------------
+        # 2. waveform tensor 입력
+        # -------------------------
+        elif torch.is_tensor(wav_inputs):
+            if wav_inputs.dim() == 1:
+                wav_batch = wav_inputs.unsqueeze(0).to(self.device)  # (1, T)
+            else:
+                wav_batch = wav_inputs.to(self.device)  # (B, T)
+
         else:
-            wav_batch = wav_inputs.to(self.device)
-
+            raise TypeError(f"Unsupported wav_inputs type: {type(wav_inputs)}")
+        # -------------------------
+        # 3. StyleTTS2 preprocess
+        # -------------------------
         mel_jdc = self._wav_to_jdc_input(wav_batch)  # (B, 1, 80, 192)
-
-        # 원본 pitch_extractor와 동일
-        F0_real, _, F0 = self.ref_enc(mel_jdc)  # F0_real = style feature
-
-        # ★ F0_real 그대로 사용 (이미 평균된 상태)
-        return F0_real  # (B, C) 형태로 나옴
+        F0_real, _, _ = self.ref_enc(mel_jdc)
+        return F0_real
 
 class StyleTTS2Decoders(nn.Module):
     """
-    CS / SD output을 직접 받아 StyleTTS2 hifigan Decoder로 waveform 생성
-    - TextEncoder ❌
-    - StyleEncoder ❌
-    - ProsodyPredictor ❌
+    Full StyleTTS2 inference pipeline:
+
+    (C_token, S)
+        ↓ ProsodyPredictor
+            ├─ duration (B, T_token)
+            ├─ F0_token (B, T_token)
+            └─ Energy_token (B, T_token)
+        ↓ LengthRegulator
+        ↓
+    (C_frame, S, F0_frame, Energy_frame)
+        ↓ HiFiGAN Decoder
+        ↓
+    Waveform
     """
 
     def __init__(self, styletts2_ckpt_path, device="cuda"):
-        """
-        styletts2_ckpt_path:
-            StyleTTS2 pretrained checkpoint (.pth / .pt)
-            내부에 'decoder', 'model_params.decoder'가 있어야 함
-        """
         super().__init__()
         self.device = device
 
         ckpt = torch.load(styletts2_ckpt_path, map_location="cpu")
 
-        # StyleTTS2 hifigan Decoder
+        # ---------------- ProsodyPredictor ----------------
+        self.prosody = ProsodyPredictor(**ckpt["model_params"]["prosody"])
+        self.prosody.load_state_dict(ckpt["prosody_predictor"])
+        self.prosody.to(device).eval().requires_grad_(False)
+
+        # ---------------- HiFiGAN Decoder ----------------
         self.decoder = Decoder(**ckpt["model_params"]["decoder"])
         self.decoder.load_state_dict(ckpt["decoder"])
-        self.decoder.to(device).eval()
+        self.decoder.to(device).eval().requires_grad_(False)
+
+    # ---------------------------------------------------
+    # Length Regulator
+    # ---------------------------------------------------
+    @torch.no_grad()
+    def _length_regulator(self, x, durations):
+        """
+        x: (B, C, T_token) or (B, T_token)
+        durations: (B, T_token)
+        return:
+            expanded to frame-level
+        """
+        B = durations.size(0)
+        expanded = []
+
+        for b in range(B):
+            reps = torch.clamp(torch.round(durations[b]), min=1).long()
+
+            if x.dim() == 3:
+                # (C, T_token)
+                x_b = x[b]
+                x_exp = torch.repeat_interleave(x_b, reps, dim=1)
+            else:
+                # (T_token,)
+                x_b = x[b]
+                x_exp = torch.repeat_interleave(x_b, reps, dim=0)
+
+            expanded.append(x_exp)
+
+        # pad to same length
+        max_len = max(e.size(-1) for e in expanded)
+
+        padded = []
+        for e in expanded:
+            pad_len = max_len - e.size(-1)
+            if x.dim() == 3:
+                e = F.pad(e, (0, pad_len))
+            else:
+                e = F.pad(e, (0, pad_len))
+            padded.append(e)
+
+        return torch.stack(padded)
 
     @torch.no_grad()
-    def forward(self, C_s, S_s, F0=None, N=None):
+    def forward(self, C_token, S):
         """
         Args:
-            C_s: (B, C, T)    ← CS output (frame-level content)
-            S_s: (B, D)       ← SD output (style embedding)
-            F0:  (B, T) or None
-            N:   (B, T) or None
+            C_token: (B, H, T_token)
+            S:       (B, D)
 
         Returns:
             wav: (B, 1, T_audio)
         """
-        C_s = C_s.to(self.device)
-        S_s = S_s.to(self.device)
 
-        B, _, T = C_s.shape
+        C_token = C_token.to(self.device)
+        S = S.to(self.device)
 
-        # StyleTTS2는 F0 / N 필수 → 없으면 0으로 대체
-        if F0 is None:
-            F0 = torch.zeros(B, T, device=self.device)
-        else:
-            F0 = F0.to(self.device)
+        # ---------------- Prosody ----------------
+        prosody_out = self.prosody(C_token, S)
 
-        if N is None:
-            N = torch.zeros(B, T, device=self.device)
-        else:
-            N = N.to(self.device)
+        duration = prosody_out["dur_pred"]   # (B, T_token)
+        F0_token = prosody_out["F0_pred"]    # (B, T_token)
+        N_token = prosody_out["N_pred"]      # (B, T_token)
 
-        # hifigan Decoder
+        # ---------------- Length Regulation ----------------
+        C_frame = self._length_regulator(C_token, duration)
+        F0_frame = self._length_regulator(F0_token, duration)
+        N_frame = self._length_regulator(N_token, duration)
+
+        # shape 보정
+        if F0_frame.dim() == 3:
+            F0_frame = F0_frame.squeeze(1)
+        if N_frame.dim() == 3:
+            N_frame = N_frame.squeeze(1)
+
+        # ---------------- Decoder ----------------
         wav = self.decoder(
-            asr=C_s,
-            F0_curve=F0,
-            N=N,
-            s=S_s
+            asr=C_frame,
+            F0_curve=F0_frame,
+            N=N_frame,
+            s=S
         )
 
         return wav

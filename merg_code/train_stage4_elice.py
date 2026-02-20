@@ -16,6 +16,7 @@ import decord
 import numpy as np
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
 logging.getLogger().setLevel(logging.ERROR)
 
 
@@ -25,17 +26,21 @@ def parser_args():
     parser.add_argument('--mode', type=str, default='train', help='train or test')
     parser.add_argument('--data_path', type=str, default='merg_data')
     # parser.add_argument('--audio_path', type=str, default="/home/elicer/bk/dataset/audio_v5_0") # elice
-    parser.add_argument('--audio_path', type=str, default="/mnt/SSD_raid1/AvaMERG/audio_v5_0") # navi
+    # parser.add_argument('--audio_path', type=str, default="/mnt/SSD_raid1/AvaMERG/audio_v5_0") # navi
+    parser.add_argument('--audio_path', type=str, default="/mnt/HDD_raid1/AvaMERG_jhchoi/AvaMERG/audio_v5_0") # a6000
     # parser.add_argument('--video_path', type=str, default="/home/elicer/bk/dataset/video_v5_0") # elice
-    parser.add_argument('--video_path', type=str, default="/mnt/SSD_raid1/AvaMERG/video_v5_0") # navi
+    # parser.add_argument('--video_path', type=str, default="/mnt/SSD_raid1/AvaMERG/video_v5_0") # navi
+    parser.add_argument('--video_path', type=str, default="/mnt/HDD_raid1/AvaMERG_jhchoi/AvaMERG/video_v5_0") # a6000
     parser.add_argument('--ckpt_path', type=str, default="ckpt/merg_ckpt/10000")
     parser.add_argument('--local_rank', default=0, type=int)
     parser.add_argument('--save_path', type=str, default='ckpt/merg_ckpt_total/')
     parser.add_argument('--log_path', type=str, default='ckpt/merg_ckpt_total/')
     parser.add_argument('--assets_path', type=str, default='./assets/')
     parser.add_argument('--max_length', type=int, default=1024)
-    parser.add_argument('--cs_path', type=str, default='ckpt/merg-total_ckpt/20251229_014849/4000/cs_4000.pt')
-    parser.add_argument('--sd_path', type=str, default='ckpt/merg-total_ckpt/20251229_014849/4000/sd_4000.pt')
+    parser.add_argument('--cs_path', type=str, default='ckpt/merg-total_ckpt/20260214_182100/5000/cs_5000.pt')
+    parser.add_argument('--sd_path', type=str, default='ckpt/merg-total_ckpt/20260214_182100/5000/sd_5000.pt')
+    parser.add_argument('--styletts2_ckpt_dir', type=str, default='ckpt/pretrained_ckpt/styletts2_ckpt')
+    parser.add_argument('--keyface_ckpt_dir', type=str, default='ckpt/pretrained_ckpt/keyface_ckpt')
     return parser.parse_args()
 
 
@@ -111,6 +116,26 @@ def load_video_batch(path_list, device, num_frames=8):
 
     return out.to(device)
 
+def align_cs_to_gold(C_s, C_s_gold):
+    """
+    Align CS output temporal length to StyleTTS2 TextEncoder output
+    Args:
+        C_s:      (B, 768, T_cs)
+        C_s_gold: (B, 768, T_text)
+    Returns:
+        C_s_aligned: (B, 768, T_text)
+    """
+    T_target = C_s_gold.size(-1)
+
+    if C_s.size(-1) == T_target:
+        return C_s
+
+    return F.interpolate(
+        C_s,
+        size=T_target,
+        mode="linear",
+        align_corners=False
+    )
 
 def main(args):
     # load_config 가 dict 를 받는 경우를 유지
@@ -184,6 +209,7 @@ def main(args):
 
     step = 0
     agent.ds_engine.eval()
+    agent.ds_engine.requires_grad_(False)
     cs.train()
     sd.train()
 
@@ -209,6 +235,8 @@ def main(args):
         )
 
         for batch in pbar:
+            if batch is None:
+                continue
             with torch.no_grad():
                 outputs, _, _, _, _ = agent.return_output(batch)
                 hs = outputs.hidden_states[-1].float()
@@ -222,19 +250,11 @@ def main(args):
             responses = [conv["response"] for conv in batch["conversations"]]
             C_s_gold = sty.text_content(responses).to(device).float()
 
-            response_aud_paths = [p for sub in batch["response_audio"] for p in sub]
-            response_vid_paths = [p for sub in batch["response_video"] for p in sub]
-
-            if len(response_aud_paths) == 0 or len(response_vid_paths) == 0:
-                continue
-
-            wav_batch = load_wav_batch(response_aud_paths, device)
-            vid_batch = load_video_batch(response_vid_paths, device)
-            if wav_batch is None or vid_batch is None:
-                continue
+            wav_batch = batch['response_audio'].to(device, non_blocking=True)
+            vid_batch = batch['response_video'].to(device, non_blocking=True)
 
             C_v_gold = keyface.content_from_audio(wav_batch).float()
-            S_s_gold = sty.style_from_audio(response_aud_paths).reshape(-1, 192).to(device).float()
+            S_s_gold = sty.style_from_audio(wav_batch).reshape(-1, 192).to(device).float()
             S_v_gold = keyface.style_from_video(vid_batch).float()
 
             labels = {
@@ -244,7 +264,15 @@ def main(args):
                 'tone': normalize_label(batch['response_timbre'], device),
             }
 
-            L_ccl = loss_ccl(C_s, C_v, C_s_gold, C_v_gold)
+            '''
+            C_s: torch.Size([1, 768])
+            C_s g: torch.Size([1, 768, 18])
+            C_v: torch.Size([1, 768])
+            C_v g: torch.Size([1, 768])
+            '''
+            C_s_aligned = align_cs_to_gold(C_s, C_s_gold)
+
+            L_ccl = loss_ccl(C_s_aligned, C_v, C_s_gold, C_v_gold)
             L_sal = loss_sal(S_s, S_v, S_s_gold, S_v_gold)
             L_cls = loss_cls(logits, labels)
 

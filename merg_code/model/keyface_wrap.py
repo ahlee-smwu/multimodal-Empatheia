@@ -5,15 +5,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Wav2Vec2Model
 import torchvision.models as models
+from pathlib import Path
 
-KEYFACE_DIR = "../keyface_cvpr"
+KEYFACE_DIR = (Path(__file__).resolve().parent / ".." / "keyface_cvpr").resolve()
 if os.path.exists(KEYFACE_DIR):
     if KEYFACE_DIR not in sys.path:
         sys.path.append(KEYFACE_DIR)
         sys.path.append(os.path.join(KEYFACE_DIR, "sgm"))
     print(f"[INFO] KeyFace path found: {KEYFACE_DIR}")
 else:
-
     print(f"[ERROR] KeyFace folder NOT FOUND at: {KEYFACE_DIR}")
 
 

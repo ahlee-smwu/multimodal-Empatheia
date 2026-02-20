@@ -38,91 +38,140 @@ def fuse_gaussian_poe(mu_s, logvar_s, mu_v, logvar_v, eps=1e-8):
 
 
 class ContentSynchronizer(nn.Module):
-    """논문 4.3: Transformer-based VAE, z_c^{s/v} = EncCS(FFN(r_t), q_c^{s/v})"""
+    """
+    CS:
+      - C_s: time-preserving (B, 768, 18)  ← StyleTTS2 text_content shape 대응
+      - C_v: utterance-level (B, 768)      ← 기존 구조 그대로
+    """
 
-    def __init__(self, d_in=4096, d_latent=512, d_out=768, num_layers=4, nhead=8, dim_ff=2048, qdim=768):
+    def __init__(
+        self,
+        d_in=4096,
+        d_latent=512,
+        d_out=768,
+        num_layers=4,
+        nhead=8,
+        dim_ff=2048,
+        qdim=768,
+        T_text=18,   # 🔥 고정된 text length
+    ):
         super().__init__()
-        self.d_in = d_in
-        self.d_out = d_out
-        self.ffn_in = nn.Linear(d_in, d_out)
-        self.enc = make_transformer(d_model=d_out, nhead=nhead, num_layers=num_layers, dim_ff=dim_ff, encoder=True)
 
+        self.d_out = d_out
+        self.T_text = T_text
+
+        # =========================================================
+        # 1. Encoder backbone (기존 그대로)
+        # =========================================================
+        self.ffn_in = nn.Linear(d_in, d_out)
+        self.enc = make_transformer(
+            d_model=d_out,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_ff=dim_ff,
+            encoder=True
+        )
+
+        # =========================================================
+        # 2. VAE (utterance-level latent)  ← 기존 그대로
+        # =========================================================
         self.to_mu = nn.Linear(d_out, d_latent)
         self.to_logvar = nn.Linear(d_out, d_latent)
         self.reparam = Reparam()
         self.latent_to_mem = nn.Linear(d_latent, d_out)
 
-        self.q_s_c = nn.Parameter(torch.randn(1, 1, qdim))
+        # =========================================================
+        # 3. Decoder queries
+        #   🔥 C_s: 18 queries (time-preserving)
+        #   🔥 C_v: 1 query (utterance-level)
+        # =========================================================
+        self.q_s_c = nn.Parameter(torch.randn(1, T_text, qdim))
         self.q_v_c = nn.Parameter(torch.randn(1, 1, qdim))
 
-        self.dec = make_transformer(d_model=d_out, nhead=nhead, num_layers=num_layers, dim_ff=dim_ff, encoder=False)
+        # =========================================================
+        # 4. Transformer decoder (기존 그대로)
+        # =========================================================
+        self.dec = make_transformer(
+            d_model=d_out,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_ff=dim_ff,
+            encoder=False
+        )
+
         self.proj_s = nn.Linear(d_out, d_out)
         self.proj_v = nn.Linear(d_out, d_out)
 
+    # ---------------------------------------------------------
+    # decoder helper (기존 논리 그대로)
+    # ---------------------------------------------------------
     def _decode(self, mem, q):
-        """✅ 안정적 decoder: explicit mask + proper shape"""
+        """
+        mem: (B, 1, 768)
+        q:   (1, Tq, 768)
+        return:
+            (B, Tq, 768)
+        """
         B = mem.size(0)
-        device = mem.device
-        dtype = mem.dtype
+        qB = q.expand(B, -1, -1)
+        out = self.dec(tgt=qB, memory=mem)
+        return out
 
-        mem = mem.to(dtype)  # [B, 1, 768]
-        q = q.to(dtype)
-
-        qB = q.expand(B, -1, -1)  # [B, 1, 768]
-
-        # seq_len=1이므로 empty mask
-        tgt_mask = torch.zeros((1, 1), dtype=torch.bool, device=device)
-
-        with torch.no_grad():  # mask는 gradient 불필요
-            out = self.dec(tgt=qB, memory=mem, tgt_mask=tgt_mask)
-        return out[:, 0, :]  # [B, 768]
-
-    def _cast_layers_to_input_dtype(self, dtype):
-        for module in [self.ffn_in, self.enc, self.to_mu, self.to_logvar,
-                       self.latent_to_mem, self.dec, self.proj_s, self.proj_v]:
-            module.to(dtype)
-        self.q_s_c.data = self.q_s_c.data.to(dtype)
-        self.q_v_c.data = self.q_v_c.data.to(dtype)
-
+    # ---------------------------------------------------------
+    # forward
+    # ---------------------------------------------------------
     def forward(self, r_t, return_kld=True):
-        """✅ Dynamic shape: [B, T, 4096] or [B*T, 4096]"""
-        self._cast_layers_to_input_dtype(r_t.dtype) # dtype: float16
+        """
+        Args:
+            r_t: (B, T, 4096)
 
-        orig_shape = r_t.shape
-        was_flat = len(r_t.shape) == 2
+        Returns:
+            C_s: (B, 768, 18)   ← 🔥 NEW (time preserved)
+            C_v: (B, 768)       ← 기존 유지
+            kld
+        """
 
-        # ✅ Input reshape
-        if was_flat:  # [B*T, 4096]
-            B_T = r_t.size(0)
-            r_t = r_t.unsqueeze(1)  # [B*T, 1, 4096]
+        # =====================================================
+        # 1. Encoder (기존 그대로)
+        # =====================================================
+        x = self.ffn_in(r_t)     # (B, T, 768)
+        h_enc = self.enc(x)      # (B, T, 768)
 
-        # 1. FFN -> Encoder
-        x = self.ffn_in(r_t)  # [B, T, 768]
-        h_enc = self.enc(x)  # [B, T, 768]
-        pooled = h_enc.mean(dim=1)  # [B, 768]
+        # =====================================================
+        # 2. Utterance-level latent (기존 그대로)
+        # =====================================================
+        pooled = h_enc.mean(dim=1)   # (B, 768)
 
-        # 2. VAE
         mu = self.to_mu(pooled)
         logvar = self.to_logvar(pooled)
-        z_c = self.reparam(mu, logvar)
-        mem = self.latent_to_mem(z_c).unsqueeze(1)  # [B, 1, 768]
+        z = self.reparam(mu, logvar)
 
-        # 3. Decode
-        C_s_raw = self._decode(mem, self.q_s_c)
-        C_v_raw = self._decode(mem, self.q_v_c)
-        C_s = self.proj_s(C_s_raw)
-        C_v = self.proj_v(C_v_raw)
+        mem = self.latent_to_mem(z).unsqueeze(1)  # (B, 1, 768)
 
-        # 4. KLD
-        kld = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1).mean() if return_kld else 0.0
+        # =====================================================
+        # 3. C_s: time-preserving (🔥 shape만 변경)
+        # =====================================================
+        C_s_raw = self._decode(mem, self.q_s_c)   # (B, 18, 768)
+        C_s = self.proj_s(C_s_raw)                # (B, 18, 768)
+        C_s = C_s.transpose(1, 2)                 # (B, 768, 18)
 
-        # ✅ Shape 복원
-        if was_flat:
-            C_s = C_s.view(orig_shape[0], -1).mean(dim=1)
-            C_v = C_v.view(orig_shape[0], -1).mean(dim=1)
+        # =====================================================
+        # 4. C_v: utterance-level (기존 그대로)
+        # =====================================================
+        C_v = self._decode(mem, self.q_v_c)       # (B, 1, 768)
+        C_v = self.proj_v(C_v).squeeze(1)         # (B, 768)
+
+        # =====================================================
+        # 5. KLD
+        # =====================================================
+        kld = (
+            -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+            .sum(dim=1)
+            .mean()
+            if return_kld else 0.0
+        )
 
         return C_s, C_v, kld
-
 
 class StyleDisentangler(nn.Module):
     """논문 4.3: disentangle E_s/v, P_s/v from r_s, r_v -> S_s/v = E_s/v ⊕ P_s/v"""

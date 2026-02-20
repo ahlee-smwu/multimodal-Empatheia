@@ -14,7 +14,7 @@ from .losses_cs_sd import loss_ccl, loss_sal, loss_cls
 # from speech_generator.generate_audio import StyleTTS2
 # from talking_face_generator.generate_video import generate_video
 from .styletts2_wrap import StyleTTS2Encoders
-from .dreamtalk_wrap import DreamTalkEncoders
+from .keyface_wrap import KeyFaceEncoders
 import soundfile as sf
 import cv2
 import glob
@@ -35,7 +35,7 @@ class StoppingCriteriaSub(StoppingCriteria):
         # ---- Gold encoders (frozen) ----
         self.styletts2 = StyleTTS2Encoders(self.args.get('styletts2_ckpt_dir', 'ckpt/styletts2_encoders')).to(
             self.device)
-        self.dreamtalk = DreamTalkEncoders(self.args.get('dreamtalk_ckpt_dir', 'ckpt/dreamtalk_encoders')).to(
+        self.dreamtalk = KeyFaceEncoders(self.args.get('dreamtalk_ckpt_dir', 'ckpt/dreamtalk_encoders')).to(
             self.device)
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):

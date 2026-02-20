@@ -16,7 +16,7 @@ kld_weight: 1.0e-4
 lr: 5.0e-5 # 2.0e-4
 weight_decay: 0.01
 batch_size: 4
-num_workers: 4
+num_workers: 1
 
 max_steps_s1: 1000
 max_steps_s2: 2000

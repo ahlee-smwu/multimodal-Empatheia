@@ -34,7 +34,7 @@ def load_dataset(args):
         num_workers=min(8, max(1, torch.get_num_threads() // world_size)),
         collate_fn=dataset.collate_fn,
         pin_memory=True,
-        persistent_workers=True,
+        persistent_workers=False,
         prefetch_factor=2,
     )
 
