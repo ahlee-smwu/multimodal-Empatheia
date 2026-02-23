@@ -31,11 +31,11 @@ def load_dataset(args):
         dataset,
         batch_size=batch_size,
         sampler=sampler,
-        num_workers=min(8, max(1, torch.get_num_threads() // world_size)),
+        num_workers=12, #min(8, max(1, torch.get_num_threads() // world_size)),
         collate_fn=dataset.collate_fn,
         pin_memory=True,
-        persistent_workers=False,
-        prefetch_factor=2,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
     return dataset, dataloader, sampler

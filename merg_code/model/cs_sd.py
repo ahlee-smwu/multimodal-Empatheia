@@ -40,8 +40,8 @@ def fuse_gaussian_poe(mu_s, logvar_s, mu_v, logvar_v, eps=1e-8):
 class ContentSynchronizer(nn.Module):
     """
     CS:
-      - C_s: time-preserving (B, 768, 18)  ← StyleTTS2 text_content shape 대응
-      - C_v: utterance-level (B, 768)      ← 기존 구조 그대로
+      - C_s: time-preserving (B, 512, 15)
+      - C_v: utterance-level (B, 768)
     """
 
     def __init__(
@@ -49,15 +49,17 @@ class ContentSynchronizer(nn.Module):
         d_in=4096,
         d_latent=512,
         d_out=768,
+        d_out_s=512, # for s_c output dim
         num_layers=4,
         nhead=8,
         dim_ff=2048,
         qdim=768,
-        T_text=18,   # 🔥 고정된 text length
+        T_text=15,
     ):
         super().__init__()
 
         self.d_out = d_out
+        self.d_out_s = d_out_s
         self.T_text = T_text
 
         # =========================================================
@@ -99,7 +101,7 @@ class ContentSynchronizer(nn.Module):
             encoder=False
         )
 
-        self.proj_s = nn.Linear(d_out, d_out)
+        self.proj_s = nn.Linear(d_out, d_out_s)
         self.proj_v = nn.Linear(d_out, d_out)
 
     # ---------------------------------------------------------
@@ -151,15 +153,15 @@ class ContentSynchronizer(nn.Module):
         # =====================================================
         # 3. C_s: time-preserving (🔥 shape만 변경)
         # =====================================================
-        C_s_raw = self._decode(mem, self.q_s_c)   # (B, 18, 768)
-        C_s = self.proj_s(C_s_raw)                # (B, 18, 768)
-        C_s = C_s.transpose(1, 2)                 # (B, 768, 18)
+        C_s_raw = self._decode(mem, self.q_s_c)   # (B, 15, 768)
+        C_s = self.proj_s(C_s_raw)                # (B, 15, 512)
+        C_s = C_s.transpose(1, 2)                 # (B, 512, 15)
 
         # =====================================================
         # 4. C_v: utterance-level (기존 그대로)
         # =====================================================
         C_v = self._decode(mem, self.q_v_c)       # (B, 1, 768)
-        C_v = self.proj_v(C_v).squeeze(1)         # (B, 768)
+        C_v = self.proj_v(C_v) #.squeeze(1)         # (B, 768)
 
         # =====================================================
         # 5. KLD
@@ -175,8 +177,13 @@ class ContentSynchronizer(nn.Module):
 
 class StyleDisentangler(nn.Module):
     """논문 4.3: disentangle E_s/v, P_s/v from r_s, r_v -> S_s/v = E_s/v ⊕ P_s/v"""
+    """
+    SD:
+      - S_s: time-preserving (B, 128)
+      - S_v: utterance-level (B, 1024)
+    """
 
-    def __init__(self, d_in=4096, d_latent=256, d_out=768, num_layers=4, nhead=8, dim_ff=2048, qdim=768,
+    def __init__(self, d_in=4096, d_latent=256, d_out=512, d_out_s=128, d_out_v=1024, num_layers=4, nhead=8, dim_ff=2048, qdim=512,
                  n_emotions=7, n_age=4, n_gender=2, n_tone=3):
         super().__init__()
 
@@ -202,8 +209,10 @@ class StyleDisentangler(nn.Module):
 
         self.head_e = nn.Linear(d_out, d_out)
         self.head_p = nn.Linear(d_out, d_out)
-        self.fuser_s = nn.Linear(d_out * 2, 192)
-        self.fuser_v = nn.Linear(d_out * 2, d_out) # StyleTTS2->JDCNet output dim
+        self.fuser_s = nn.Linear(d_out * 2, d_out)
+        self.fuser_v = nn.Linear(d_out * 2, d_out)
+        self.proj_s = nn.Linear(d_out, d_out_s)
+        self.proj_v = nn.Linear(d_out, d_out_v)
 
         self.cls_emotion = nn.Linear(d_out, n_emotions)
         self.cls_age = nn.Linear(d_out, n_age)
@@ -295,8 +304,8 @@ class StyleDisentangler(nn.Module):
         # 4. Style fusion (논문 수식 7)
         S_s = self.fuser_s(torch.cat([E_s, P_v], dim=-1))
         S_v = self.fuser_v(torch.cat([E_v, P_v], dim=-1))
-        #S_s = self.fuser_s(torch.cat([E_s, P_s], dim=-1))  # [B, 768]
-        #S_v = self.fuser_v(torch.cat([E_v, P_v], dim=-1))
+        S_s = self.proj_s(S_s)  # [B, 128]
+        S_v = self.proj_v(S_v)  # [B, 1024]
 
         # 5. Global features for classification supervision (논문 D.3 Step3)
         E_global = 0.5 * (E_s + E_v)  # fuse E_s, E_v

@@ -51,11 +51,21 @@ class multimodal_empathetic_dialogue(Dataset):
     def __init__(self, args):
         super(multimodal_empathetic_dialogue, self).__init__()
         self.args = args
-        # ★ ADD THIS BLOCK RIGHT HERE
         models_cfg = args.get('models', {})
         self.audio_path = self.args.get('audio_path', None)
-        self.video_path = self.args.get('video_path', None)
-        # ★ END NEW BLOCK
+        self.video_path = self.args.get('video_path_frame', None)
+        self.audio_index = {}
+        self.video_index = {}
+        if self.audio_path is not None:
+            for p in glob.glob(os.path.join(self.audio_path, "*.wav")):
+                key = os.path.basename(p).split("_")[0]
+                self.audio_index[key] = p
+        if self.video_path is not None:
+            for p in glob.glob(os.path.join(self.video_path, "*.pt")):
+                base = os.path.basename(p).replace(".pt", "")
+                key = base.split("_")[0]
+                self.video_index[key] = p
+
         self.age_projection = {
             "child": 0,
             "young": 1,
@@ -217,6 +227,7 @@ class multimodal_empathetic_dialogue(Dataset):
 
         self.valid_data = []
 
+
     def __len__(self):
         return len(self.data)
 
@@ -224,47 +235,56 @@ class multimodal_empathetic_dialogue(Dataset):
         item = self.data[idx]
         dia_id = transform_conv_id(item['conversation_id'])
         length = len(item['turn']['dialogue_history'])
-        self.audio_path = self.args.get('audio_path', None)
-        self.video_path = self.args.get('video_path', None)
 
         response_utt_name = f'dia{dia_id}utt{length}'
 
         # =========================================================
         # 🔊 AUDIO: path → waveform tensor (T,)
         # =========================================================
+        MIN_AUDIO_SAMPLES = 12000  # 약 0.75초 (16k 기준)
         response_audio = None
+
         if self.audio_path is not None:
-            audio_paths = glob.glob(
-                os.path.join(self.audio_path, f"{response_utt_name}_*.wav")
-            )
-            if len(audio_paths) > 0:
+            audio_path = self.audio_index.get(response_utt_name, None)
+            if audio_path is not None:
                 try:
-                    w, sr = torchaudio.load(audio_paths[0])
+                    w, sr = torchaudio.load(audio_path)
                     if w.dim() == 2:
-                        w = w.mean(0)  # (T,)
-                    response_audio = w  # ❗ pad 안 함
+                        w = w.mean(0)
+                    if w.shape[-1] >= MIN_AUDIO_SAMPLES:
+                        response_audio = w
                 except Exception as e:
-                    print(f"[WARN] failed to load wav {audio_paths[0]}: {e}")
+                    print(f"[WARN] failed to load wav {audio_path}: {e}")
 
         # =========================================================
         # 🎥 VIDEO: path → frames tensor (T, C, H, W)
         # =========================================================
         response_video = None
+
+        # 1) propcess video in train sequence
+        # if self.video_path is not None:
+        #     video_path = self.video_index.get(response_utt_name, None)
+        #     if video_path is not None:
+        #         try:
+        #             if video_path not in self.video_reader_cache:
+        #                 self.video_reader_cache[video_path] = decord.VideoReader(video_path)
+        #             vr = self.video_reader_cache[video_path]
+        #             if len(vr) > 0:
+        #                 idxs = np.linspace(0, len(vr) - 1, 8).astype(int)
+        #                 frames = vr.get_batch(idxs)
+        #                 frames = torch.from_numpy(frames.asnumpy())
+        #                 frames = frames.permute(0, 3, 1, 2).float()
+        #                 response_video = frames
+        #         except Exception as e:
+        #             print(f"[WARN] failed to load video {video_path}: {e}")
+        # 2) prepocess .pt video
         if self.video_path is not None:
-            video_paths = glob.glob(
-                os.path.join(self.video_path, f"{response_utt_name}_*.mp4")
-            )
-            if len(video_paths) > 0:
+            video_path = self.video_index.get(response_utt_name, None)
+            if video_path is not None:
                 try:
-                    vr = decord.VideoReader(video_paths[0])
-                    if len(vr) > 0:
-                        idxs = np.linspace(0, len(vr) - 1, 8).astype(int)
-                        frames = vr.get_batch(idxs)
-                        frames = torch.from_numpy(frames.asnumpy())
-                        frames = frames.permute(0, 3, 1, 2).float()
-                        response_video = frames  # (T, C, H, W)
+                    response_video = torch.load(video_path)
                 except Exception as e:
-                    print(f"[WARN] failed to load video {video_paths[0]}: {e}")
+                    print(f"[WARN] failed to load video {video_path}: {e}")
 
         emotion = item['turn']['chain_of_empathy'].get('speaker_emotion', [])
         if isinstance(emotion, list):

@@ -151,7 +151,7 @@ class MERGModel(nn.Module):
     #         gen_token_idx = self.llama_tokenizer(f'[AUD{i}]', add_special_tokens=False).input_ids
     #         assert len(gen_token_idx) == 1, gen_token_idx
     #         self.args['gen_audio_token_idx'].append(gen_token_idx[0])
-        
+
     def encode_video(self, inputs):
         input_video_embs_list = []
         video_llama_atts_list = []
@@ -168,7 +168,7 @@ class MERGModel(nn.Module):
                 pattern = os.path.join(self.args['video_path'], f'dia{dia_str}utt{utt_id + 1}_[0-9]*.mp4')
                 video_pathes = glob.glob(pattern)
                 if not video_pathes:
-                    raise FileNotFoundError(f"No audio file found for pattern: {pattern}")
+                    raise FileNotFoundError(f"No video file found for pattern: {pattern}")
                 video_paths.append(video_pathes[0])
             inputs = {ModalityType.VISION: data.load_and_transform_video_data(video_paths, self.device)}
                 # convert into visual dtype
@@ -181,6 +181,7 @@ class MERGModel(nn.Module):
             input_video_embs_list.append(input_video_embs)
             video_llama_atts_list.append(video_llama_atts)
         return input_video_embs_list, video_llama_atts
+
 
     def encode_audio(self, inputs):
         input_audio_embs_list = []

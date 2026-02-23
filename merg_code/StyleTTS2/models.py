@@ -585,6 +585,7 @@ class DurationEncoder(nn.Module):
 
         return x.transpose(-1, -2)
 
+
     def inference(self, x, style):
         x = self.embedding(x.transpose(-1, -2)) * math.sqrt(self.d_model)
         style = style.expand(x.shape[0], x.shape[1], -1)
@@ -594,8 +595,11 @@ class DurationEncoder(nn.Module):
         return output
 
     def length_to_mask(self, lengths):
-        mask = torch.arange(lengths.max()).unsqueeze(0).expand(lengths.shape[0], -1).type_as(lengths)
-        mask = torch.gt(mask + 1, lengths.unsqueeze(1))
+        max_len = lengths.max()
+        mask = torch.arange(
+            max_len,
+            device=lengths.device
+        ).unsqueeze(0) >= lengths.unsqueeze(1)
         return mask
 
 

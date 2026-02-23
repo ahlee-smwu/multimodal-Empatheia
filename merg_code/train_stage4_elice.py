@@ -1,3 +1,8 @@
+import os
+os.environ["CFLAGS"] = "-I/usr/include"
+os.environ["CPLUS_INCLUDE_PATH"] = "/usr/include"
+os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"
+os.environ["DS_BUILD_OPS"] = "1"
 from header import *
 from dataset import load_dataset
 from model import *
@@ -17,6 +22,9 @@ import numpy as np
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
+import sys
+from pathlib import Path
+sys.path = [str(p) if isinstance(p, Path) else p for p in sys.path]
 logging.getLogger().setLevel(logging.ERROR)
 
 
@@ -31,14 +39,15 @@ def parser_args():
     # parser.add_argument('--video_path', type=str, default="/home/elicer/bk/dataset/video_v5_0") # elice
     # parser.add_argument('--video_path', type=str, default="/mnt/SSD_raid1/AvaMERG/video_v5_0") # navi
     parser.add_argument('--video_path', type=str, default="/mnt/HDD_raid1/AvaMERG_jhchoi/AvaMERG/video_v5_0") # a6000
+    parser.add_argument('--video_path_frame', type=str, default="/mnt/HDD_raid1/AvaMERG_jhchoi/AvaMERG/video_frame") # a6000 preprocessed
     parser.add_argument('--ckpt_path', type=str, default="ckpt/merg_ckpt/10000")
     parser.add_argument('--local_rank', default=0, type=int)
     parser.add_argument('--save_path', type=str, default='ckpt/merg_ckpt_total/')
     parser.add_argument('--log_path', type=str, default='ckpt/merg_ckpt_total/')
     parser.add_argument('--assets_path', type=str, default='./assets/')
     parser.add_argument('--max_length', type=int, default=1024)
-    parser.add_argument('--cs_path', type=str, default='ckpt/merg-total_ckpt/20260214_182100/5000/cs_5000.pt')
-    parser.add_argument('--sd_path', type=str, default='ckpt/merg-total_ckpt/20260214_182100/5000/sd_5000.pt')
+    parser.add_argument('--cs_path', type=str)
+    parser.add_argument('--sd_path', type=str)
     parser.add_argument('--styletts2_ckpt_dir', type=str, default='ckpt/pretrained_ckpt/styletts2_ckpt')
     parser.add_argument('--keyface_ckpt_dir', type=str, default='ckpt/pretrained_ckpt/keyface_ckpt')
     return parser.parse_args()
@@ -166,6 +175,7 @@ def main(args):
         d_in=cfg.d_in,
         d_latent=cfg.d_latent_cs,
         d_out=cfg.d_out,
+        d_out_s=cfg.d_out_cs, # 512
         num_layers=cfg.num_layers,
         nhead=cfg.nhead,
         dim_ff=cfg.dim_ff,
@@ -174,7 +184,9 @@ def main(args):
     sd = StyleDisentangler(
         d_in=cfg.d_in,
         d_latent=cfg.d_latent_sd,
-        d_out=cfg.d_out,
+        d_out=cfg.d_out_sd,
+        d_out_s=cfg.d_out_ss,  # 128
+        d_out_v=cfg.d_out_sv,  # 1024
         num_layers=cfg.num_layers,
         nhead=cfg.nhead,
         dim_ff=cfg.dim_ff,
@@ -186,6 +198,7 @@ def main(args):
     if args.cs_path and args.sd_path:
         cs.load_state_dict(torch.load(args.cs_path, map_location=device))
         sd.load_state_dict(torch.load(args.sd_path, map_location=device))
+        pass
         if is_main_process:
             print(f"✅ Loaded CS from {args.cs_path}")
             print(f"✅ Loaded SD from {args.sd_path}")
@@ -199,8 +212,8 @@ def main(args):
         weight_decay=cfg.weight_decay,
     )
 
-    sty = StyleTTS2Encoders(os.path.join(args.styletts2_ckpt_dir, 'encoders')).to(device)
-    keyface = KeyFaceEncoders(os.path.join(args.keyface_ckpt_dir, 'keyframe.pt'), d_out=cfg.d_out).to(device)
+    sty = StyleTTS2Encoders(os.path.join(args.styletts2_ckpt_dir, 'decoders')).to(device)
+    keyface = KeyFaceEncoders(os.path.join(args.keyface_ckpt_dir, 'keyframe.pt'), 512).to(device)
 
     for m in [sty, keyface]:
         m.eval()
@@ -254,7 +267,8 @@ def main(args):
             vid_batch = batch['response_video'].to(device, non_blocking=True)
 
             C_v_gold = keyface.content_from_audio(wav_batch).float()
-            S_s_gold = sty.style_from_audio(wav_batch).reshape(-1, 192).to(device).float()
+            S_acoustic_gold, _ = sty.style_from_audio(wav_batch)
+            S_s_gold = S_acoustic_gold.to(device).float()
             S_v_gold = keyface.style_from_video(vid_batch).float()
 
             labels = {
@@ -264,12 +278,23 @@ def main(args):
                 'tone': normalize_label(batch['response_timbre'], device),
             }
 
-            '''
-            C_s: torch.Size([1, 768])
-            C_s g: torch.Size([1, 768, 18])
-            C_v: torch.Size([1, 768])
-            C_v g: torch.Size([1, 768])
-            '''
+            print('cs', C_s.shape)
+            print('cs g', C_s_gold.shape)
+            print('cv', C_v.shape)
+            print('cv g', C_v_gold.shape)
+            print('ss', S_s.shape)
+            print('ss g', S_s_gold.shape)
+            print('sv', S_v.shape)
+            print('sv g', S_v_gold.shape)
+            # cs torch.Size([1, 512, 15])
+            # cs g torch.Size([1, 512, 21])
+            # cv torch.Size([1, 768])
+            # cv g torch.Size([348, 768])
+            # ss torch.Size([1, 128])
+            # ss g torch.Size([1, 128])
+            # sv torch.Size([1, 1024])
+            # sv g torch.Size([1, 1024])
+
             C_s_aligned = align_cs_to_gold(C_s, C_s_gold)
 
             L_ccl = loss_ccl(C_s_aligned, C_v, C_s_gold, C_v_gold)

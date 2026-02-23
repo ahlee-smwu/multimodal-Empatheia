@@ -12,9 +12,13 @@ sys.path.append('merg_code/StyleTTS2')
 
 from StyleTTS2.Utils.PLBERT.util import load_plbert
 from StyleTTS2.Utils.JDC.model import JDCNet
-from StyleTTS2.models import ProsodyPredictor
+from StyleTTS2.models import ProsodyPredictor, StyleEncoder
 from StyleTTS2.Modules.hifigan import Generator, Decoder
 from StyleTTS2.models import build_model
+from Modules.hifigan import Decoder
+import yaml
+from munch import Munch
+from transformers import AlbertModel, AlbertTokenizer
 
 '''
 Text
@@ -46,400 +50,518 @@ Waveform
 
 class PLBERTWrapper(nn.Module):
     def __init__(self, plbert_dir, device=None):
-        """
-        plbert_dir 안에 있어야 할 것:
-          - config.yml        (dataset_params.tokenizer, token_maps 등)
-          - token_maps.pkl    (phoneme/token -> id 맵)
-          - step_*.t7         (PL-BERT checkpoint, 예: step_1000000.t7)
-        """
         super().__init__()
-        self.plbert_dir = plbert_dir
+
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.plbert_dir = plbert_dir
 
-        # 1) config.yml 로드
-        cfg_path = os.path.join(plbert_dir, "config.yml")
-        with open(cfg_path, "r") as f:
+        # ----------------------------
+        # 1. config 로드
+        # ----------------------------
+        with open(os.path.join(plbert_dir, "config.yml"), "r") as f:
             cfg = yaml.safe_load(f)
+
         dset_cfg = cfg["dataset_params"]
+
         self.token_sep = dset_cfg.get("token_separator", " ")
-        self.token_mask = dset_cfg.get("token_mask", "M")
         self.word_sep_id = dset_cfg.get("word_separator", 3039)
-        base_tok_name = dset_cfg["tokenizer"]  # 보통 "transfo-xl-wt103"[web:70]
 
-        # 2) base tokenizer 로드 (Transformer-XL)
-        self.base_tokenizer = TransfoXLTokenizer.from_pretrained(base_tok_name)
-
-        # 3) token_maps.pkl 로드 (phoneme/token -> vocab id)
-        tmaps_path = os.path.join(plbert_dir, dset_cfg["token_maps"])  # "token_maps.pkl"
-        with open(tmaps_path, "rb") as f:
+        # ----------------------------
+        # 2. token_maps 로드
+        # ----------------------------
+        with open(os.path.join(plbert_dir, dset_cfg["token_maps"]), "rb") as f:
             self.token_maps = pickle.load(f)
-        # self.token_maps: {str_token: int_id, ...}
+        # print(type(self.token_maps))
+        # print(list(self.token_maps.items())[:10])
 
-        # 4) PL-BERT 모델 로드 (TransfoXLModel + step_*.t7 state_dict)
-        self.plbert = TransfoXLModel.from_pretrained(base_tok_name)
-
-        ckpt_name = None
-        for fn in os.listdir(plbert_dir):
-            if fn.startswith("step_") and fn.endswith(".t7"):
-                ckpt_name = fn
-                break
-        if ckpt_name is None:
-            raise FileNotFoundError(f"No step_*.t7 found under {plbert_dir}")
-        ckpt = torch.load(os.path.join(plbert_dir, ckpt_name), map_location="cpu")
-        state_dict = ckpt.get("net", ckpt)
-        self.plbert.load_state_dict(state_dict, strict=False)
+        # ----------------------------
+        # 3. Custom PLBERT 로드
+        # ----------------------------
+        self.plbert = load_plbert(plbert_dir)
 
         self.plbert.to(self.device)
         self.plbert.eval()
         self.plbert.requires_grad_(False)
 
+    # ----------------------------
+    # text → ids
+    # ----------------------------
     def _tokens_to_ids(self, tokens):
-        """
-        tokens: List[str] (이미 token_separator 기준으로 split된 토큰들)
-        우선 token_maps를 적용, 없으면 base tokenizer로 encode.
-        """
         ids = []
         for tok in tokens:
             if tok in self.token_maps:
                 ids.append(self.token_maps[tok])
-            else:
-                sub_ids = self.base_tokenizer.encode(tok, add_special_tokens=False)
-                ids.extend(sub_ids)
-        # 문장 끝에 word_separator id 추가
         ids.append(self.word_sep_id)
         return ids
 
+    # ----------------------------
+    # encode
+    # ----------------------------
     @torch.no_grad()
     def encode_texts(self, texts):
-        """
-        texts: List[str] 또는 str
-        - 이상적으로는 phoneme 시퀀스를 token_separator 로 join한 문자열.
-        - 현재는 response 문장을 그대로 넣되, token_separator 기준으로 split해서 token_maps 적용.
-        return:
-          - hidden_states: (B, T, H)
-        """
+
         if isinstance(texts, str):
             texts = [texts]
 
         all_ids = []
         max_len = 0
+
         for txt in texts:
-            tokens = txt.split(self.token_sep)  # config.yml 의 token_separator 사용
-            ids = self._tokens_to_ids(tokens)
+
+            words = txt.lower().split()
+
+            ids = []
+
+            for w in words:
+                if w in self.token_maps:
+                    ids.append(self.token_maps[w])
+                else:
+                    # OOV는 0으로
+                    ids.append(0)
+
+            if len(ids) == 0:
+                ids = [0]
+
             all_ids.append(ids)
             max_len = max(max_len, len(ids))
 
-        pad_id = self.base_tokenizer.pad_token_id or 0
+        # padding
         input_ids = []
         for ids in all_ids:
             pad_len = max_len - len(ids)
-            input_ids.append(ids + [pad_id] * pad_len)
-        input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)  # (B, T)
+            input_ids.append(ids + [0] * pad_len)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
 
         out = self.plbert(input_ids=input_ids)
-        h = out.last_hidden_state  # (B, T, H)
-        return h
-
+        return out #(B,T,768)
 
 class StyleTTS2Encoders(nn.Module):
-    def __init__(self, ckpt_dir, proj_dim=768, device=None, target_sr=24000):
+    def __init__(self, ckpt_path, device=None, target_sr=24000):
         super().__init__()
+
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.target_sr = target_sr
 
-        # 1) PLBERT + tokenizer + token_maps
+        # ----------------------------
+        # 1. config 로드
+        # ----------------------------
+        with open(os.path.join(ckpt_path, "config.yml"), "r") as f:
+            config = yaml.safe_load(f)
+
+        mp = config["model_params"]
+
+        hidden_dim = mp["hidden_dim"]   # 512
+        style_dim = mp["style_dim"]     # 128
+
+        # ----------------------------
+        # 2. checkpoint 먼저 로드
+        # ----------------------------
+        ckpt = torch.load(
+            os.path.join(ckpt_path, "epochs_2nd_00020.pth"),
+            map_location="cpu"
+        )
+        net = ckpt["net"]
+
+        # ----------------------------
+        # 3. PLBERT 로드 (Custom)
+        # ----------------------------
         plbert_dir = 'merg_code/StyleTTS2/Utils/PLBERT'
         self.plbert_wrap = PLBERTWrapper(plbert_dir, device=self.device)
-        self.text_aco = self.plbert_wrap.plbert  # PL-BERT 본체
 
-        hidden_dim = self.text_aco.config.d_model  # Transformer-XL hidden size
-        self.text_proj = nn.Linear(hidden_dim, proj_dim, bias=False).to(self.device)
+        t_weight = net["bert_encoder"]["module.weight"]  # (512,768)
+        t_bias = net["bert_encoder"]["module.bias"]
 
-        # (선택) MERG 쪽 finetune weight 반영
-        text_aco_ckpt_path = os.path.join(ckpt_dir, 'text_aco_encoder.pt')
-        if os.path.exists(text_aco_ckpt_path):
-            text_aco_ckpt = torch.load(text_aco_ckpt_path, map_location='cpu')
-            self.text_aco.load_state_dict(text_aco_ckpt.get('model', {}), strict=False)
+        self.bert_encoder = nn.Linear(
+            t_weight.size(1),  # 768
+            t_weight.size(0)  # 512
+        )
 
-        # 2) JDCNet 스타일 인코더 (E_ref)
-        '''
-            wav file (24kHz) 
-                ↓ torchaudio.load + resample(24000)
-            waveform tensor (B, T) 
-                ↓ MelSpectrogram(n_fft=1024, hop=256, n_mels=80)
-            mel_spec (B, 80, T') 
-                ↓ log1p + 길이 192로 crop/pad 
-            mel_192 (B, 80, 192) 
-                ↓ unsqueeze(1) 
-            mel_jdc (B, 1, 80, 192)  ← JDCNet(seq_len=192) 입력
-                ↓ JDCNet.forward()
-            F0_real (B, 192)          ← style vector 완성! 
-        '''
-        self.ref_enc = JDCNet(num_class=1, seq_len=192)
-        ref_enc_ckpt_path = os.path.join(ckpt_dir, 'reference_encoder.pt')
-        if os.path.exists(ref_enc_ckpt_path):
-            ref_enc_ckpt = torch.load(ref_enc_ckpt_path, map_location='cpu')
-            jdc_state = ref_enc_ckpt.get('net', {})
-            jdc_state.pop('classifier.weight', None)
-            jdc_state.pop('classifier.bias', None)
-            self.ref_enc.load_state_dict(jdc_state, strict=False)
+        self.bert_encoder.weight.data.copy_(t_weight)
+        self.bert_encoder.bias.data.copy_(t_bias)
 
-        self.text_aco.to(self.device).eval().requires_grad_(False)
-        self.text_proj.eval().requires_grad_(False)
-        self.ref_enc.to(self.device).eval().requires_grad_(False)
+        # ----------------------------
+        # 4. Style Encoder (Acoustic)
+        # ----------------------------
+        from StyleTTS2.models import StyleEncoder
 
-    # ------------------ 텍스트 인코더 ------------------@torch.no_grad()
+        self.style_encoder = StyleEncoder(
+            dim_in=mp["dim_in"],
+            style_dim=style_dim,
+            max_conv_dim=hidden_dim
+        )
+
+        style_state = {
+            k.replace("module.", ""): v
+            for k, v in net["style_encoder"].items()
+        }
+        self.style_encoder.load_state_dict(style_state, strict=True)
+
+        # ----------------------------
+        # 5. Predictor Encoder (Prosodic)
+        # ----------------------------
+        self.predictor_encoder = StyleEncoder(
+            dim_in=mp["dim_in"],
+            style_dim=style_dim,
+            max_conv_dim=hidden_dim
+        )
+
+        predictor_enc_state = {
+            k.replace("module.", ""): v
+            for k, v in net["predictor_encoder"].items()
+        }
+        self.predictor_encoder.load_state_dict(predictor_enc_state, strict=True)
+
+        # ----------------------------
+        # 6. freeze
+        # ----------------------------
+        self.to(self.device)
+        self.eval()
+        self.requires_grad_(False)
+
+    # --------------------------------
+    # TEXT → C_token (B,512,T)
+    # --------------------------------
+    @torch.no_grad()
     def text_content(self, texts):
-        """
-        StyleTTS2 TextEncoder output을 모방
-        Args:
-            texts: List[str] or str
-        Returns:
-            C: (B, hidden_dim, T_text)
-        """
 
-        # PL-BERT token-level output
-        h_text = self.plbert_wrap.encode_texts(texts)   # (B, T, H)
-        # project to StyleTTS2 hidden_dim
-        h_proj = self.text_proj(h_text)                 # (B, T, hidden_dim)
-        # StyleTTS2 TextEncoder output format
-        C = h_proj.transpose(1, 2)                      # (B, hidden_dim, T)
+        h = self.plbert_wrap.encode_texts(texts)  # (B,T,768)
 
-        return C
+        if h.size(-1) != self.bert_encoder.in_features:
+            raise RuntimeError(
+                f"Hidden mismatch: {h.size(-1)} vs {self.bert_encoder.in_features}"
+            )
 
-    # ------------------ 오디오 로더 ------------------
-    @torch.no_grad()
-    def _load_wav(self, path):
-        """
-        path: str (.wav 경로)
-        return: 1D waveform (T,) @ target_sr, mono
-        """
-        wav, sr = torchaudio.load(path)
-        # mono
-        if wav.size(0) > 1:
-            wav = wav.mean(dim=0, keepdim=True)
-        # resample
-        if sr != self.target_sr:
-            wav = torchaudio.functional.resample(wav, sr, self.target_sr)
-        wav = wav.squeeze(0)  # (T,)
-        return wav
+        h = self.bert_encoder(h)  # (B,T,512)
+
+        return h.transpose(1, 2)  # (B,512,T)
 
     @torch.no_grad()
-    def _paths_to_batch(self, paths):
+    def wav_to_mel(self, wav):
         """
-        paths: List[str]
-        return: (B, T) waveform batch @ target_sr
+        wav: (B,T) or (T,)
+        return: (B,80,T')
         """
-        if not paths:
-            raise ValueError("paths cannot be empty.")
 
-        wavs = [self._load_wav(p) for p in paths]  # list of (T_i,)
-        max_len = max(w.size(0) for w in wavs)
-        batch = []
-        for w in wavs:
-            pad_len = max_len - w.size(0)
-            if pad_len > 0:
-                w = F.pad(w, (0, pad_len))  # 뒤쪽 zero-pad
-            batch.append(w)
-        batch = torch.stack(batch, dim=0)  # (B, T)
-        return batch.to(self.device)
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0)
 
-    # ------------------ JDC 입력 변환 ------------------
-    @torch.no_grad()
-    def _wav_to_jdc_input(self, wav):
-        """
-        StyleTTS2 원본 preprocess(wave) 재현
-        """
-        device = wav.device
+        wav = wav.to(self.device)
 
-        # 원본 MEL_PARAMS (StyleTTS2 표준)
         mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=24000,
-            n_fft=1024,
-            hop_length=256,  # hop*2=512ms frame
-            win_length=1024,
+            n_fft=2048,
+            win_length=1200,
+            hop_length=300,
             n_mels=80,
             f_min=0.0,
             f_max=8000.0,
-            power=1.0
-        ).to(device)
+            power=1.0,
+        ).to(self.device)
 
-        wav = wav.contiguous()
-        mel = mel_transform(wav)  # (B, 80, T')
-        mel = torch.log1p(mel)  # 원본 preprocess
-        mel = mel.to(device)
+        mel = mel_transform(wav)  # (B,80,T')
+        mel = torch.log(mel + 1e-5)
 
-        # 길이 192로 맞추기 (seq_len=192)
-        B, F, T = mel.shape
-        if T > 192:
-            start = (T - 192) // 2
-            mel = mel[:, :, start:start + 192]
-        elif T < 192:
-            pad_t = 192 - T
-            mel = torch.nn.functional.pad(mel, (0, pad_t))
+        return mel
 
-        # JDCNet 입력 형태: (B, 1, 80, 192)
-        mel_jdc = mel.unsqueeze(1)  # (B, 1, 80, 192)
-
-        return mel_jdc
-
-    # ------------------ 스타일 추출 ------------------
+    # --------------------------------
+    # MEL → Style (128, 128)
+    # --------------------------------
     @torch.no_grad()
-    def style_from_audio(self, wav_inputs):
-        """
-        Args:
-            wav_inputs:
-                - str: single wav path
-                - List[str]: wav paths
-                - Tensor (B, T): waveform batch
-                - Tensor (T,): single waveform
-        Returns:
-            F0_real: (B, C)
-        """
+    def style_from_audio(self, wav):
 
-        # -------------------------
-        # 1. path 입력
-        # -------------------------
-        if isinstance(wav_inputs, str):
-            wav_batch = self._paths_to_batch([wav_inputs])
+        mel = self.wav_to_mel(wav)  # ✅ waveform → mel
 
-        elif isinstance(wav_inputs, list) and isinstance(wav_inputs[0], str):
-            wav_batch = self._paths_to_batch(wav_inputs)
-        # -------------------------
-        # 2. waveform tensor 입력
-        # -------------------------
-        elif torch.is_tensor(wav_inputs):
-            if wav_inputs.dim() == 1:
-                wav_batch = wav_inputs.unsqueeze(0).to(self.device)  # (1, T)
-            else:
-                wav_batch = wav_inputs.to(self.device)  # (B, T)
+        if mel.dim() == 3:
+            mel = mel.unsqueeze(1)  # (B,1,80,T)
 
-        else:
-            raise TypeError(f"Unsupported wav_inputs type: {type(wav_inputs)}")
-        # -------------------------
-        # 3. StyleTTS2 preprocess
-        # -------------------------
-        mel_jdc = self._wav_to_jdc_input(wav_batch)  # (B, 1, 80, 192)
-        F0_real, _, _ = self.ref_enc(mel_jdc)
-        return F0_real
+        s_acoustic = self.style_encoder(mel)  # (B,128)
+        s_prosodic = self.predictor_encoder(mel)  # (B,128)
+
+        return s_acoustic, s_prosodic
 
 class StyleTTS2Decoders(nn.Module):
-    """
-    Full StyleTTS2 inference pipeline:
-
-    (C_token, S)
-        ↓ ProsodyPredictor
-            ├─ duration (B, T_token)
-            ├─ F0_token (B, T_token)
-            └─ Energy_token (B, T_token)
-        ↓ LengthRegulator
-        ↓
-    (C_frame, S, F0_frame, Energy_frame)
-        ↓ HiFiGAN Decoder
-        ↓
-    Waveform
-    """
-
-    def __init__(self, styletts2_ckpt_path, device="cuda"):
+    def __init__(self, ckpt_path, device="cuda"):
         super().__init__()
         self.device = device
 
-        ckpt = torch.load(styletts2_ckpt_path, map_location="cpu")
+        with open(os.path.join(ckpt_path, "config.yml"), "r") as f:
+            config = yaml.safe_load(f)
 
-        # ---------------- ProsodyPredictor ----------------
-        self.prosody = ProsodyPredictor(**ckpt["model_params"]["prosody"])
-        self.prosody.load_state_dict(ckpt["prosody_predictor"])
-        self.prosody.to(device).eval().requires_grad_(False)
+        mp = config["model_params"]
+        self.hidden_dim = mp["hidden_dim"]   # 512
+        self.style_dim  = mp["style_dim"]    # 128
+        self.max_dur    = mp["max_dur"]      # 여기 값이 15인 경우가 많음
 
-        # ---------------- HiFiGAN Decoder ----------------
-        self.decoder = Decoder(**ckpt["model_params"]["decoder"])
-        self.decoder.load_state_dict(ckpt["decoder"])
-        self.decoder.to(device).eval().requires_grad_(False)
+        self.prosody = ProsodyPredictor(
+            style_dim=self.style_dim,
+            d_hid=self.hidden_dim,
+            nlayers=mp["n_layer"],
+            max_dur=self.max_dur,
+            dropout=mp["dropout"],
+        )
 
-    # ---------------------------------------------------
-    # Length Regulator
-    # ---------------------------------------------------
-    @torch.no_grad()
-    def _length_regulator(self, x, durations):
-        """
-        x: (B, C, T_token) or (B, T_token)
-        durations: (B, T_token)
-        return:
-            expanded to frame-level
-        """
-        B = durations.size(0)
-        expanded = []
+        self.decoder = Decoder(
+            dim_in=self.hidden_dim,
+            style_dim=self.style_dim,
+            dim_out=mp["n_mels"],
+            resblock_kernel_sizes=mp["decoder"]["resblock_kernel_sizes"],
+            upsample_rates=mp["decoder"]["upsample_rates"],
+            upsample_initial_channel=mp["decoder"]["upsample_initial_channel"],
+            resblock_dilation_sizes=mp["decoder"]["resblock_dilation_sizes"],
+            upsample_kernel_sizes=mp["decoder"]["upsample_kernel_sizes"],
+        )
 
-        for b in range(B):
-            reps = torch.clamp(torch.round(durations[b]), min=1).long()
+        ckpt = torch.load(os.path.join(ckpt_path, "epochs_2nd_00020.pth"), map_location="cpu")
+        net = ckpt["net"]
 
-            if x.dim() == 3:
-                # (C, T_token)
-                x_b = x[b]
-                x_exp = torch.repeat_interleave(x_b, reps, dim=1)
-            else:
-                # (T_token,)
-                x_b = x[b]
-                x_exp = torch.repeat_interleave(x_b, reps, dim=0)
+        predictor_state = {k.replace("module.", ""): v for k, v in net["predictor"].items()}
+        self.prosody.load_state_dict(predictor_state, strict=True)
 
-            expanded.append(x_exp)
+        decoder_state = {k.replace("module.", ""): v for k, v in net["decoder"].items()}
+        self.decoder.load_state_dict(decoder_state, strict=True)
 
-        # pad to same length
-        max_len = max(e.size(-1) for e in expanded)
-
-        padded = []
-        for e in expanded:
-            pad_len = max_len - e.size(-1)
-            if x.dim() == 3:
-                e = F.pad(e, (0, pad_len))
-            else:
-                e = F.pad(e, (0, pad_len))
-            padded.append(e)
-
-        return torch.stack(padded)
+        self.to(device)
+        self.eval()
+        self.requires_grad_(False)
 
     @torch.no_grad()
-    def forward(self, C_token, S):
+    def forward(self, C_s, S_s):
         """
-        Args:
-            C_token: (B, H, T_token)
-            S:       (B, D)
+        C_s: (B, 512, T_text)  e.g. (1,512,15)
+        S_s: (B, 128)          e.g. (1,128)
+        return: wav
+        """
 
-        Returns:
-            wav: (B, 1, T_audio)
-        """
+        # ============================================================
+        # 0) 입력 정규화
+        # ============================================================
+        C_token = C_s
+        S = S_s
+
+        if C_token.dim() == 2:
+            C_token = C_token.unsqueeze(0)
+        if S.dim() == 1:
+            S = S.unsqueeze(0)
+        if S.dim() == 3 and S.size(1) == 1:
+            S = S.squeeze(1)
+
+        # (B,T,512) -> (B,512,T)
+        if C_token.size(1) != 512 and C_token.size(-1) == 512:
+            C_token = C_token.transpose(1, 2)
 
         C_token = C_token.to(self.device)
         S = S.to(self.device)
 
-        # ---------------- Prosody ----------------
-        prosody_out = self.prosody(C_token, S)
+        B, Cc, T_text = C_token.shape
+        if Cc != 512:
+            raise RuntimeError(f"[0] C_token must be (B,512,T_text), got {tuple(C_token.shape)}")
+        if S.shape != (B, 128):
+            raise RuntimeError(f"[0] S must be (B,128), got {tuple(S.shape)}")
 
-        duration = prosody_out["dur_pred"]   # (B, T_token)
-        F0_token = prosody_out["F0_pred"]    # (B, T_token)
-        N_token = prosody_out["N_pred"]      # (B, T_token)
+        text_lengths = torch.full((B,), T_text, dtype=torch.long, device=self.device)
+        mask = torch.zeros((B, T_text), dtype=torch.bool, device=self.device)
 
-        # ---------------- Length Regulation ----------------
-        C_frame = self._length_regulator(C_token, duration)
-        F0_frame = self._length_regulator(F0_token, duration)
-        N_frame = self._length_regulator(N_token, duration)
+        # ============================================================
+        # 1) dummy alignment
+        # ============================================================
+        alignment = torch.eye(T_text, device=self.device).unsqueeze(0).expand(B, -1, -1)
 
-        # shape 보정
-        if F0_frame.dim() == 3:
-            F0_frame = F0_frame.squeeze(1)
-        if N_frame.dim() == 3:
-            N_frame = N_frame.squeeze(1)
+        # ============================================================
+        # 2) duration logits -> duration
+        #    관측: duration_logits: (B, T_text, Nd=50)
+        # ============================================================
+        duration_logits, _ = self.prosody(C_token, S, text_lengths, alignment, mask)
 
-        # ---------------- Decoder ----------------
+        if duration_logits.dim() != 3 or duration_logits.size(0) != B or duration_logits.size(1) != T_text:
+            raise RuntimeError(
+                f"[2] duration_logits unexpected shape {tuple(duration_logits.shape)}; "
+                f"expected (B,T_text,Nd)=({B},{T_text},Nd)"
+            )
+
+        # (B,T_text,Nd) -> (B,T_text) duration (>=1)
+        duration = torch.argmax(duration_logits, dim=-1).long() + 1
+        duration = duration.clamp(min=1)
+
+        # ============================================================
+        # 3) length regulator: token -> frame
+        #    C_frame: (B, T_asr, 512)
+        # ============================================================
+        x_tok = C_token.transpose(1, 2)  # (B,T_text,512)
+        C_frame = self._length_regulator(x_tok, duration)  # (B,T_asr,512)
+
+        if C_frame.dim() != 3 or C_frame.size(0) != B or C_frame.size(2) != 512:
+            raise RuntimeError(f"[3] C_frame must be (B,T_asr,512), got {tuple(C_frame.shape)}")
+
+        T_asr = C_frame.size(1)
+        C_frame_ct = C_frame.transpose(1, 2)  # (B,512,T_asr)
+
+        # ============================================================
+        # 4) F0/N predictor 입력: (B,640,T_asr) = (512+128,T)
+        # ============================================================
+        S_ct = S.unsqueeze(-1).expand(B, 128, T_asr)  # (B,128,T_asr)
+        F0N_in = torch.cat([C_frame_ct, S_ct], dim=1)  # (B,640,T_asr)
+
+        F0_frame, N_frame = self.prosody.F0Ntrain(F0N_in, S)
+
+        # ============================================================
+        # 5) ✅ HiFiGAN(decoder) 규약에 맞추기
+        #    - decoder는 F0_curve를 (B,T)로 받음 (내부에서 unsqueeze(1))
+        #    - N도 (B,T)
+        #    - asr은 (B,512,T)
+        #    - T가 다르면 정수배 repeat로만 맞춤 (보간 금지)
+        # ============================================================
+
+        # decoder 규약: F0_curve, N은 (B,T)로 넣는다 (decoder가 내부에서 unsqueeze(1)함)
+        F0_curve = self._to_BT_strict(F0_frame, name="F0_curve")  # (B,T_f0)
+        N_curve = self._to_BT_strict(N_frame, name="N")  # (B,T_n)
+
+        T_f0 = F0_curve.size(1)
+        T_n = N_curve.size(1)
+        if T_f0 != T_n:
+            raise RuntimeError(f"[final] F0/N time mismatch: F0={T_f0}, N={T_n}")
+
+        # asr은 (B,512,T_asr)
+        asr = C_frame.transpose(1, 2)  # (B,512,T_asr)
+        T_asr = asr.size(2)
+
+        # --- 정수배 repeat로 시간축 정합 (양방향 모두 처리) ---
+        if T_asr != T_f0:
+            if T_asr % T_f0 == 0:
+                # F0/N이 더 짧다 -> F0/N을 늘린다 (지금 네 에러가 이 케이스: 30 vs 15)
+                r = T_asr // T_f0
+                F0_curve = torch.repeat_interleave(F0_curve, repeats=r, dim=1)  # (B,T_asr)
+                N_curve = torch.repeat_interleave(N_curve, repeats=r, dim=1)  # (B,T_asr)
+
+            elif T_f0 % T_asr == 0:
+                # asr이 더 짧다 -> asr을 늘린다
+                r = T_f0 // T_asr
+                asr = torch.repeat_interleave(asr, repeats=r, dim=2)  # (B,512,T_f0)
+                T_asr = asr.size(2)
+
+            else:
+                raise RuntimeError(
+                    f"[final] Cannot match time by integer repeat: T_asr={T_asr}, T_f0={T_f0}"
+                )
+
+        # 최종 검증: decoder cat이 절대 안 터지게(규약대로) 확인
+        T = asr.size(2)
+        if F0_curve.size(1) != T or N_curve.size(1) != T:
+            raise RuntimeError(
+                f"[final] Time mismatch before decoder: asr T={T}, F0 T={F0_curve.size(1)}, N T={N_curve.size(1)}"
+            )
+        if asr.size(1) != 512:
+            raise RuntimeError(f"[final] asr channel mismatch: expected 512, got {asr.size(1)}")
+
+        # decoder 호출
+        # print(asr.shape, F0_curve.shape, N_curve.shape, S.shape)
+        # ars:torch.Size([1, 512, 30]), FO:torch.Size([1, 30]), N:torch.Size([1, 30]), s:torch.Size([1, 128])
+
+        # --- decoder 내부 conv를 실제로 돌려서, cat 직전의 길이를 맞춘다 (정확) ---
+        with torch.no_grad():
+            # decoder 안에서 만들어질 F0/N feature의 time 길이를 미리 확인
+            F0_feat_T = self.decoder.F0_conv(F0_curve.unsqueeze(1)).size(-1)
+            N_feat_T = self.decoder.N_conv(N_curve.unsqueeze(1)).size(-1)
+
+        T_asr = asr.size(2)
+
+        # F0_conv와 N_conv는 같은 downsample을 해야 정상
+        if F0_feat_T != N_feat_T:
+            raise RuntimeError(f"Decoder conv time mismatch: F0_feat_T={F0_feat_T}, N_feat_T={N_feat_T}")
+
+        # 1) conv 결과가 asr보다 짧으면: F0/N 입력 길이를 늘려서(conv 후) asr와 같게 만든다
+        if F0_feat_T < T_asr:
+            if T_asr % F0_feat_T != 0:
+                raise RuntimeError(f"Cannot integer-match conv output to asr: T_asr={T_asr}, F0_feat_T={F0_feat_T}")
+
+            r = T_asr // F0_feat_T  # 네 케이스는 보통 2 (30 // 15)
+            # F0_curve/N_curve의 입력 time을 r배로 늘리면, stride=2인 conv면 출력이 r배 늘어남
+            F0_curve = torch.repeat_interleave(F0_curve, repeats=r, dim=1)
+            N_curve = torch.repeat_interleave(N_curve, repeats=r, dim=1)
+
+            # 재확인
+            with torch.no_grad():
+                F0_feat_T2 = self.decoder.F0_conv(F0_curve.unsqueeze(1)).size(-1)
+                N_feat_T2 = self.decoder.N_conv(N_curve.unsqueeze(1)).size(-1)
+            if F0_feat_T2 != T_asr or N_feat_T2 != T_asr:
+                raise RuntimeError(
+                    f"After upsample, conv output still mismatch: "
+                    f"F0_feat_T={F0_feat_T2}, N_feat_T={N_feat_T2}, asr_T={T_asr}"
+                )
+
+        # 2) conv 결과가 asr보다 길면: asr을 줄여서 맞춘다 (이 케이스는 드물지만 정석으로 처리)
+        elif F0_feat_T > T_asr:
+            if F0_feat_T % T_asr != 0:
+                raise RuntimeError(f"Cannot integer-match asr to conv output: T_asr={T_asr}, F0_feat_T={F0_feat_T}")
+            r = F0_feat_T // T_asr
+            # 시간축을 r배로 줄임(정수배) - 보간 금지
+            asr = asr[:, :, ::r]
+
+            # 최종 확인: asr 길이 == conv 결과 길이
+            if asr.size(2) != F0_feat_T:
+                raise RuntimeError(f"After downsample asr, mismatch: asr_T={asr.size(2)}, conv_T={F0_feat_T}")
+
+        # 같으면 그대로 진행
+        # print("FINAL shapes -> asr", asr.shape, "F0_curve", F0_curve.shape, "N", N_curve.shape)
+
         wav = self.decoder(
-            asr=C_frame,
-            F0_curve=F0_frame,
-            N=N_frame,
+            asr=asr,  # (B,512,T)
+            F0_curve=F0_curve,  # (B,T)
+            N=N_curve,  # (B,T)
             s=S
         )
-
         return wav
 
+    # ------------------------------------------------------------
+    # helper: (B,T)로 엄격 변환 (decoder 규약)
+    # ------------------------------------------------------------
+    @torch.no_grad()
+    def _to_BT_strict(self, x, name="tensor"):
+        """
+        decoder가 기대하는 (B,T)로 엄격 변환.
+        - (B,T) -> OK
+        - (B,1,T) -> squeeze(1)
+        - (B,T,1) -> squeeze(-1)
+        그 외 -> 에러 (보간/흉내 금지)
+        """
+        if x.dim() == 2:
+            return x
+        if x.dim() == 3:
+            if x.size(1) == 1:   # (B,1,T)
+                return x.squeeze(1)
+            if x.size(-1) == 1:  # (B,T,1)
+                return x.squeeze(-1)
+        raise RuntimeError(f"{name} must be (B,T) or squeezable, got {tuple(x.shape)}")
+
+    # ------------------------------------------------------------
+    # helper: length regulator
+    # ------------------------------------------------------------
+    @torch.no_grad()
+    def _length_regulator(self, x, durations):
+        """
+        x: (B, T_text, 512)
+        durations: (B, T_text) positive ints
+        return: (B, T_asr, 512)
+        """
+        if durations.dim() != 2:
+            durations = durations.view(durations.size(0), -1)
+
+        B, T_text, C = x.shape
+        if C != 512:
+            raise RuntimeError(f"x must have C=512, got {C}")
+        if durations.shape != (B, T_text):
+            raise RuntimeError(f"durations must be (B,T_text)=({B},{T_text}), got {tuple(durations.shape)}")
+
+        expanded = []
+        for b in range(B):
+            reps = durations[b].long().view(-1)    # (T_text,)
+            x_b = x[b]                             # (T_text,512)
+            x_exp = torch.repeat_interleave(x_b, reps, dim=0)
+            expanded.append(x_exp)
+
+        max_len = max(e.size(0) for e in expanded)
+        padded = [F.pad(e, (0, 0, 0, max_len - e.size(0))) for e in expanded]
+        return torch.stack(padded, dim=0)
 
 if __name__=='__main__':
     # test code

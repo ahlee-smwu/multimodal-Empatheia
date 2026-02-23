@@ -4,7 +4,7 @@ import os
 os.environ["LOCAL_RANK"] = "0"
 os.environ["RANK"] = "0"
 os.environ["WORLD_SIZE"] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 from header import *
 from model import *
@@ -23,7 +23,6 @@ import torch.distributed as dist
 
 logging.getLogger().setLevel(logging.ERROR)
 
-
 # ------------------------------------------------
 # Args
 # ------------------------------------------------
@@ -32,7 +31,7 @@ def parser_args():
     parser.add_argument('--model', type=str, default='merg')
     parser.add_argument('--ckpt_path', type=str, default="ckpt/merg_ckpt/10000") # merg model ckpt
     parser.add_argument('--ckpt_module', type=str,
-                        default='ckpt/merg-total_ckpt/20260215_001337_3ep/10000')
+                        default='ckpt/merg-total_ckpt/20260222_225627/10')
     parser.add_argument('--ckpt_aud', type=str,
                         default='ckpt/pretrained_ckpt/styletts2_ckpt/decoders')
     parser.add_argument('--out_dir', type=str, default='output')
@@ -72,7 +71,6 @@ def main(args):
 
     # ------------------ dataset ------------------
     train_data, train_iter, _ = load_dataset(cfg_dict)
-    batch = next(iter(train_iter))
 
     # ------------------ MERG agent (GPU + DeepSpeed) ------------------
     agent = load_model(cfg_dict)
@@ -116,32 +114,34 @@ def main(args):
             ↓
           waveform
     '''
-    # sty = StyleTTS2Decoders(
-    #     styletts2_ckpt_path=os.path.join(args.ckpt_aud, 'epochs_2nd_00020.pth'),
-    #     device=device
-    # ).eval()
 
-    # ------------------ MERG forward (GPU) ------------------
-    outputs, *_ = agent.return_output(batch)
-    hs = outputs.hidden_states[-1].float()
+    sty = StyleTTS2Decoders(args.ckpt_aud, device=device).eval()
 
-    # ------------------ CS / SD ------------------
-    C_s, _, _ = cs(hs)
-    S_s, _, _, _ = sd(hs, hs)
-    print(f"C_s: {C_s.shape}, S_s: {S_s.shape}")
+    for batch in train_iter:
+        if batch is None:
+            continue
+        # ------------------ MERG forward (GPU) ------------------
+        outputs, *_ = agent.return_output(batch)
+        hs = outputs.hidden_states[-1].float()
 
-    # ------------------ TTS ------------------
-    sty = StyleTTS2Decoders(args.ckpt_aud)
-    wav = sty(C_s, S_s)
+        # ------------------ CS / SD ------------------
+        C_s, _, _ = cs(hs)
+        S_s, _, _, _ = sd(hs, hs)
+        # print(f"C_s: {C_s.shape}, S_s: {S_s.shape}")
+        # C_s: torch.Size([1, 512, 15]), S_s: torch.Size([1, 128])
 
-    # ------------------ save ------------------
-    out_dir = os.path.join(args.out_dir, 'audio')
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, 'out.wav')
-    torchaudio.save(out_path, wav[0].unsqueeze(0).cpu(), 24000)
+        # ------------------ TTS ------------------
+        wav = sty(C_s, S_s)
 
-    print(f"✅ Saved: {out_path}")
-    print(f"C_s: {C_s.shape}, S_s: {S_s.shape}")
+        # ------------------ save ------------------
+        out_dir = os.path.join(args.out_dir, 'audio')
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, 'out.wav')
+        x = wav[0].detach().cpu().squeeze()
+        torchaudio.save(out_path, x.unsqueeze(0), 24000)
+
+        print(f"✅ Saved: {out_path}")
+        print(f"C_s: {C_s.shape}, S_s: {S_s.shape}")
 
 
 if __name__ == "__main__":

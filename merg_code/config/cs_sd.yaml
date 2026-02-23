@@ -3,6 +3,10 @@ device: cuda
 
 d_in: 4096
 d_out: 768
+d_out_sd: 512 # default out dim of sd
+d_out_cs: 512
+d_out_ss: 128
+d_out_sv: 1024
 nhead: 8
 num_layers: 4
 dim_ff: 2048
@@ -16,7 +20,7 @@ kld_weight: 1.0e-4
 lr: 5.0e-5 # 2.0e-4
 weight_decay: 0.01
 batch_size: 4
-num_workers: 1
+num_workers: 8 #1
 
 max_steps_s1: 1000
 max_steps_s2: 2000
