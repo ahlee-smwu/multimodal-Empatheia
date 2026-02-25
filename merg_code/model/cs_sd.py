@@ -55,12 +55,14 @@ class ContentSynchronizer(nn.Module):
         dim_ff=2048,
         qdim=768,
         T_text=15,
+        T_audio=600 # 약 12초
     ):
         super().__init__()
 
         self.d_out = d_out
         self.d_out_s = d_out_s
         self.T_text = T_text
+        self.T_audio = T_audio
 
         # =========================================================
         # 1. Encoder backbone (기존 그대로)
@@ -88,7 +90,7 @@ class ContentSynchronizer(nn.Module):
         #   🔥 C_v: 1 query (utterance-level)
         # =========================================================
         self.q_s_c = nn.Parameter(torch.randn(1, T_text, qdim))
-        self.q_v_c = nn.Parameter(torch.randn(1, 1, qdim))
+        self.q_v_c = nn.Parameter(torch.randn(1, T_audio, qdim))
 
         # =========================================================
         # 4. Transformer decoder (기존 그대로)
@@ -128,8 +130,8 @@ class ContentSynchronizer(nn.Module):
             r_t: (B, T, 4096)
 
         Returns:
-            C_s: (B, 768, 18)   ← 🔥 NEW (time preserved)
-            C_v: (B, 768)       ← 기존 유지
+            C_s: (B, 768, 18)
+            C_v: (B, 600, 768)
             kld
         """
 
@@ -147,7 +149,6 @@ class ContentSynchronizer(nn.Module):
         mu = self.to_mu(pooled)
         logvar = self.to_logvar(pooled)
         z = self.reparam(mu, logvar)
-
         mem = self.latent_to_mem(z).unsqueeze(1)  # (B, 1, 768)
 
         # =====================================================
@@ -160,8 +161,8 @@ class ContentSynchronizer(nn.Module):
         # =====================================================
         # 4. C_v: utterance-level (기존 그대로)
         # =====================================================
-        C_v = self._decode(mem, self.q_v_c)       # (B, 1, 768)
-        C_v = self.proj_v(C_v) #.squeeze(1)         # (B, 768)
+        C_v_raw = self._decode(mem, self.q_v_c)  # (B, 600, 768)
+        C_v = self.proj_v(C_v_raw)  # (B, 600, 768)
 
         # =====================================================
         # 5. KLD

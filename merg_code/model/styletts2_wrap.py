@@ -269,16 +269,52 @@ class StyleTTS2Encoders(nn.Module):
     # --------------------------------
     @torch.no_grad()
     def style_from_audio(self, wav):
+        try:
+            mel = self.wav_to_mel(wav)
+            # -----------------------------
+            # 1) shape 정리 (B,1,80,T)
+            # -----------------------------
+            if mel.dim() == 2:
+                mel = mel.unsqueeze(0).unsqueeze(0)
+            elif mel.dim() == 3:
+                mel = mel.unsqueeze(1)
+            elif mel.dim() == 4:
+                if mel.size(1) != 1:
+                    mel = mel[:, :1]
+            else:
+                raise RuntimeError(f"Unexpected mel shape: {mel.shape}")
 
-        mel = self.wav_to_mel(wav)  # ✅ waveform → mel
+            # -----------------------------
+            # 2) 너무 짧으면 바로 dummy 반환
+            # -----------------------------
+            if mel.size(-1) < 10 or mel.size(-2) < 10:
+                B = mel.size(0)
+                device = mel.device
+                return (
+                    torch.zeros(B, 128, device=device),
+                    torch.zeros(B, 128, device=device),
+                )
 
-        if mel.dim() == 3:
-            mel = mel.unsqueeze(1)  # (B,1,80,T)
+            # -----------------------------
+            # 3) 실제 forward
+            # -----------------------------
+            s_acoustic = self.style_encoder(mel)
+            # s_prosodic = self.predictor_encoder(mel)
 
-        s_acoustic = self.style_encoder(mel)  # (B,128)
-        s_prosodic = self.predictor_encoder(mel)  # (B,128)
+            return s_acoustic #, s_prosodic
 
-        return s_acoustic, s_prosodic
+        except Exception as e:
+            print(f"[WARN] style_from_audio fallback: {e}")
+            if isinstance(wav, torch.Tensor):
+                B = wav.size(0) if wav.dim() > 1 else 1
+                device = wav.device
+            else:
+                B = 1
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            return (
+                torch.zeros(B, 128, device=device),
+                torch.zeros(B, 128, device=device),
+            )
 
 class StyleTTS2Decoders(nn.Module):
     def __init__(self, ckpt_path, device="cuda"):

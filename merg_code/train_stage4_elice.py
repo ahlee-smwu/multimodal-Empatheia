@@ -53,18 +53,23 @@ def parser_args():
     return parser.parse_args()
 
 
-def initialize_distributed(args):
-    # args: argparse.Namespace 를 직접 수정
-    args.master_ip = os.getenv('MASTER_ADDR', 'localhost')
-    args.master_port = os.getenv('MASTER_PORT', '6000')
-    args.world_size = int(os.getenv('WORLD_SIZE', '1'))
-    # RANK 환경 변수가 있으면 우선, 없으면 기존 local_rank 유지
-    rank = int(os.getenv('RANK', str(args.local_rank)))
-    args.local_rank = rank % torch.cuda.device_count()
-    device = args.local_rank % torch.cuda.device_count()
-    torch.cuda.set_device(device)
-    deepspeed.init_distributed(dist_backend='nccl')
+# def initialize_distributed(args):
+#     # args: argparse.Namespace 를 직접 수정
+#     args.master_ip = os.getenv('MASTER_ADDR', 'localhost')
+#     args.master_port = os.getenv('MASTER_PORT', '6000')
+#     args.world_size = int(os.getenv('WORLD_SIZE', '1'))
+#     # RANK 환경 변수가 있으면 우선, 없으면 기존 local_rank 유지
+#     rank = int(os.getenv('RANK', str(args.local_rank)))
+#     args.local_rank = rank % torch.cuda.device_count()
+#     device = args.local_rank % torch.cuda.device_count()
+#     torch.cuda.set_device(device)
+#     deepspeed.init_distributed(dist_backend='nccl')
 
+def initialize_distributed(args):
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    deepspeed.init_distributed(dist_backend="nccl")
+    args.local_rank = local_rank
 
 def load_wav_batch(path_list, device):
     wavs = []
@@ -125,26 +130,37 @@ def load_video_batch(path_list, device, num_frames=8):
 
     return out.to(device)
 
-def align_cs_to_gold(C_s, C_s_gold):
+def align_cs_to_gold(C_s: torch.Tensor, C_s_gold: torch.Tensor) -> torch.Tensor:
     """
-    Align CS output temporal length to StyleTTS2 TextEncoder output
-    Args:
-        C_s:      (B, 768, T_cs)
-        C_s_gold: (B, 768, T_text)
-    Returns:
-        C_s_aligned: (B, 768, T_text)
+    Align predicted C_s (B, C, Tpred) to gold length Tgold.
     """
-    T_target = C_s_gold.size(-1)
+    assert C_s.dim() == 3 and C_s_gold.dim() == 3
+    B, C, Tpred = C_s.shape
+    _, Cg, Tgold = C_s_gold.shape
+    assert C == Cg, f"Channel mismatch: pred {C} vs gold {Cg}"
 
-    if C_s.size(-1) == T_target:
+    if Tpred == Tgold:
         return C_s
 
-    return F.interpolate(
-        C_s,
-        size=T_target,
-        mode="linear",
-        align_corners=False
-    )
+    # Adaptive avg pool along time axis
+    return F.adaptive_avg_pool1d(C_s, output_size=Tgold)
+
+def align_cv_to_gold(C_v: torch.Tensor, C_v_gold: torch.Tensor) -> torch.Tensor:
+    """
+    Align predicted C_v (B, Tpred, D) to gold length Tgold.
+    """
+    assert C_v.dim() == 3 and C_v_gold.dim() == 3
+    B, Tpred, D = C_v.shape
+    _, Tgold, Dg = C_v_gold.shape
+    assert D == Dg, f"Dim mismatch: pred {D} vs gold {Dg}"
+
+    if Tpred == Tgold:
+        return C_v
+
+    # Convert to (B, D, T) -> pool -> back
+    x = C_v.transpose(1, 2)  # (B, D, Tpred)
+    x = F.adaptive_avg_pool1d(x, output_size=Tgold)  # (B, D, Tgold)
+    return x.transpose(1, 2)  # (B, Tgold, D)
 
 def main(args):
     # load_config 가 dict 를 받는 경우를 유지
@@ -267,7 +283,7 @@ def main(args):
             vid_batch = batch['response_video'].to(device, non_blocking=True)
 
             C_v_gold = keyface.content_from_audio(wav_batch).float()
-            S_acoustic_gold, _ = sty.style_from_audio(wav_batch)
+            S_acoustic_gold = sty.style_from_audio(wav_batch)
             S_s_gold = S_acoustic_gold.to(device).float()
             S_v_gold = keyface.style_from_video(vid_batch).float()
 
@@ -278,26 +294,27 @@ def main(args):
                 'tone': normalize_label(batch['response_timbre'], device),
             }
 
-            print('cs', C_s.shape)
-            print('cs g', C_s_gold.shape)
-            print('cv', C_v.shape)
-            print('cv g', C_v_gold.shape)
-            print('ss', S_s.shape)
-            print('ss g', S_s_gold.shape)
-            print('sv', S_v.shape)
-            print('sv g', S_v_gold.shape)
+            # print('cs', C_s.shape)
+            # print('cs g', C_s_gold.shape)
+            # print('cv', C_v.shape)
+            # print('cv g', C_v_gold.shape)
+            # print('ss', S_s.shape)
+            # print('ss g', S_s_gold.shape)
+            # print('sv', S_v.shape)
+            # print('sv g', S_v_gold.shape)
             # cs torch.Size([1, 512, 15])
             # cs g torch.Size([1, 512, 21])
-            # cv torch.Size([1, 768])
-            # cv g torch.Size([348, 768])
+            # cv torch.Size([1, 600, 768])
+            # cv g torch.Size([1, 348, 768])
             # ss torch.Size([1, 128])
             # ss g torch.Size([1, 128])
             # sv torch.Size([1, 1024])
             # sv g torch.Size([1, 1024])
 
-            C_s_aligned = align_cs_to_gold(C_s, C_s_gold)
+            C_s_aligned = align_cs_to_gold(C_s, C_s_gold)  # (B,512,21)
+            C_v_aligned = align_cv_to_gold(C_v, C_v_gold)  # (B,348,768)
 
-            L_ccl = loss_ccl(C_s_aligned, C_v, C_s_gold, C_v_gold)
+            L_ccl = loss_ccl(C_s_aligned, C_v_aligned, C_s_gold, C_v_gold)
             L_sal = loss_sal(S_s, S_v, S_s_gold, S_v_gold)
             L_cls = loss_cls(logits, labels)
 

@@ -30,6 +30,7 @@ except Exception as e:
 import torch
 import torch.nn as nn
 from scripts.util.audio_wrapper import AudioWrapper
+import torch.nn.functional as F
 
 
 class KeyFaceEncoders(nn.Module):
@@ -70,17 +71,26 @@ class KeyFaceEncoders(nn.Module):
 
         return extractor
 
+    # @torch.no_grad()
+    # def content_from_audio(self, wav_batch):
+    #     emb = self.audio_encoder.wav2vec2_encoding(wav_batch)
+    #     emb = emb.transpose(0, 1)
+    #     return emb
+
     @torch.no_grad()
     def content_from_audio(self, wav_batch):
-        if wav_batch.dim() == 1:
-            wav_batch = wav_batch.unsqueeze(0)  # (1, T)
-        emb = self.audio_encoder.wav2vec2_encoding(wav_batch)
-        if emb.dim() == 2:
-            emb = emb.unsqueeze(0)  # (1, T', 768)
-        # utterance-level로 쓸 거면
-        if emb.dim() == 3:
-            emb = emb.mean(dim=1)  # (B, 768)
-        return emb
+        embs = []
+        for i in range(wav_batch.shape[0]):
+            single_wav = wav_batch[i:i+1] # [1, wav_batch]
+            # [50, 2, 768]
+            single_emb = self.audio_encoder.wav2vec2_encoding(single_wav)
+            if single_emb.dim() == 3 and single_emb.shape[1] == 2:
+                single_emb = single_emb.mean(dim=1) # [50, 2, 768] -> [50, 768]
+            elif single_emb.dim() == 3:
+                single_emb = single_emb.view(-1, 768)
+            embs.append(single_emb)
+        batch_emb = torch.stack(embs, dim=0)        # [B, T, 768]
+        return batch_emb
 
     @torch.no_grad()
     def style_from_video(self, vid_batch):

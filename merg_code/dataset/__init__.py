@@ -10,7 +10,7 @@ def load_dataset(args):
     world_size = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
 
-    if args['mode'] == 'train':
+    if args['mode'] == 'train': # 여기로 진입함은 확실히 확인함
         batch_size = args['dschf'].config['train_micro_batch_size_per_gpu']
         shuffle = True
     elif args['mode'] == 'test':
