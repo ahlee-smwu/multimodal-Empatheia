@@ -25,18 +25,6 @@ class StoppingCriteriaSub(StoppingCriteria):
         super().__init__()
         self.stops = [torch.tensor(stop, dtype=torch.long).cuda() for stop in stops]
         self.ENCOUNTERS = encounters
-        self.cs = ContentSynchronizer(d_in=768, d_latent=512, d_out=768, num_layers=4, nhead=8, dim_ff=2048)
-        self.sd = StyleDisentangler(d_in=768, d_latent=256, d_out=768, num_layers=4, nhead=8, dim_ff=2048)
-        # weights (read from args if provided)
-        self.alpha = float(self.args.get('alpha', 0.3))
-        self.beta = float(self.args.get('beta', 0.3))
-        self.kld_w = float(self.args.get('kld_weight', 1.0e-4))
-
-        # ---- Gold encoders (frozen) ----
-        self.styletts2 = StyleTTS2Encoders(self.args.get('styletts2_ckpt_dir', 'ckpt/styletts2_encoders')).to(
-            self.device)
-        self.dreamtalk = KeyFaceEncoders(self.args.get('dreamtalk_ckpt_dir', 'ckpt/dreamtalk_encoders')).to(
-            self.device)
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):
         for stop_token in self.stops:
@@ -71,6 +59,49 @@ class MERGModel(nn.Module):
         if self.args.get('freeze_input_proj'):
             for param in self.llama_proj.parameters():
                 param.requires_grad = False
+
+        # CS / SD modules
+        hidden_size = self.llama_model.config.hidden_size
+        self.cs = ContentSynchronizer(
+            d_in=hidden_size,
+            d_latent=int(args.get('d_latent_cs', 512)),
+            d_out=int(args.get('d_out', 768)),
+            num_layers=int(args.get('num_layers', 4)),
+            nhead=int(args.get('nhead', 8)),
+            dim_ff=int(args.get('dim_ff', 2048)),
+        )
+        self.sd = StyleDisentangler(
+            d_in=hidden_size,
+            d_latent=int(args.get('d_latent_sd', 256)),
+            d_out=int(args.get('d_out', 768)),
+            num_layers=int(args.get('num_layers', 4)),
+            nhead=int(args.get('nhead', 8)),
+            dim_ff=int(args.get('dim_ff', 2048)),
+        )
+
+        # loss weights
+        self.alpha = float(args.get('alpha', 0.3))
+        self.beta = float(args.get('beta', 0.3))
+        self.kld_w = float(args.get('kld_weight', 1.0e-4))
+
+        # Gold encoders (frozen) – initialized only when checkpoint paths are supplied
+        styletts2_ckpt = args.get('styletts2_ckpt_dir')
+        if styletts2_ckpt:
+            self.styletts2 = StyleTTS2Encoders(styletts2_ckpt).to(self.device)
+            for p in self.styletts2.parameters():
+                p.requires_grad = False
+            self.styletts2.eval()
+        else:
+            self.styletts2 = None
+
+        dreamtalk_ckpt = args.get('dreamtalk_ckpt_dir')
+        if dreamtalk_ckpt:
+            self.dreamtalk = KeyFaceEncoders(dreamtalk_ckpt).to(self.device)
+            for p in self.dreamtalk.parameters():
+                p.requires_grad = False
+            self.dreamtalk.eval()
+        else:
+            self.dreamtalk = None
 
 
     def _init_imagebind(self):
@@ -359,11 +390,22 @@ class MERGModel(nn.Module):
         vid_batch = torch.stack(vids, dim=0).to(self.device)  # [B, T, C, H, W]
 
         # ---- run encoders (no grad) ----
+        B = len(targets)
+        d_out = int(self.args.get('d_out', 768))
         with torch.no_grad():
-            C_s_gold = self.styletts2.text_content(targets).to(self.device)      # [B, 768]
-            C_v_gold = self.dreamtalk.content_from_audio(wav_batch)              # [B, 768] (TorchScript should map)
-            S_s_gold = self.styletts2.style_from_audio(wav_batch)                # [B, 768]
-            S_v_gold = self.dreamtalk.style_from_video(vid_batch)                # [B, 768]
+            if self.styletts2 is not None:
+                C_s_gold = self.styletts2.text_content(targets).to(self.device)
+                S_s_gold = self.styletts2.style_from_audio(wav_batch)
+            else:
+                C_s_gold = torch.zeros(B, d_out, device=self.device)
+                S_s_gold = torch.zeros(B, d_out, device=self.device)
+
+            if self.dreamtalk is not None:
+                C_v_gold = self.dreamtalk.content_from_audio(wav_batch)
+                S_v_gold = self.dreamtalk.style_from_video(vid_batch)
+            else:
+                C_v_gold = torch.zeros(B, d_out, device=self.device)
+                S_v_gold = torch.zeros(B, d_out, device=self.device)
         return C_s_gold, C_v_gold, S_s_gold, S_v_gold, targets
 
     def _empathetic_diallogue_training(self, target_ids, outputs):
@@ -482,8 +524,6 @@ class MERGModel(nn.Module):
         return outputs, inputs_embeds, input_ids, target_ids, attention_mask
 
     def return_generate(self, inputs):
-        gen_acc = 0
-
         input_ids, target_ids, attention_mask = process_batch_text_stream(self.llama_tokenizer,
                                                                           inputs['conversations'],
                                                                           self.max_length
@@ -492,9 +532,6 @@ class MERGModel(nn.Module):
         input_ids = input_ids.to(self.device)
         target_ids = target_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
-
-        return input_ids, attention_mask
-
 
         inputs_audio_embs, audio_llama_atts = self.encode_audio(inputs)
         inputs_video_embs, video_llama_atts = self.encode_video(inputs)
@@ -541,20 +578,28 @@ class MERGModel(nn.Module):
         # ----- (3) 입력 임베딩 조립
         if (inputs_audio_embs is not None and inputs_video_embs is not None
                 and len(inputs_audio_embs) > 0 and len(inputs_video_embs) > 0):
-            # 멀티모달
+            # Multimodal: build combined input embeddings and call generate with inputs_embeds.
+            # HuggingFace GenerationMixin supports inputs_embeds as a direct replacement for
+            # input_ids so audio/video tokens are naturally included in the context.
             inputs_embeds, _, attention_mask = self.prompt_wrap(
                 inputs_audio_embs,
                 inputs_video_embs,
                 input_ids,
-                torch.zeros_like(input_ids),  # 추론엔 타깃 필요 없음
+                torch.zeros_like(input_ids),  # targets not needed for inference
                 attention_mask
             )
-            # llama의 generate는 inputs_embeds로 직접 생성 불가 → 아래에서 token-by-token 방식 구현 필요 (커스텀)
-            # 또는 text-only로 강제할 땐 input_ids/attention_mask만 전달 (아래 참고)
-            # 실제로는 멀티모달임베딩을 받는 커스텀 generate 구현 필요
-            return "멀티모달 추론 커스텀 generate 함수 별도 필요 (inputs_embeds 활용)"
+            generated_ids = self.llama_model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=do_sample
+            )
+            output_text = self.llama_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            return output_text
         else:
-            # 텍스트-only 추론
+            # Text-only inference
             generated_ids = self.llama_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
