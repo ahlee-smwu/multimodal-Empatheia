@@ -17,7 +17,7 @@ from model import load_model
 from config import load_config
 from config.cs_common import load_cs_config
 from model.cs_sd import ContentSynchronizer, StyleDisentangler
-from model.styletts2_wrap import StyleTTS2Decoders, StyleTTS2Encoders
+from model.styletts2_wrap import StyleTTS2Decoders
 import glob
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -35,10 +35,12 @@ def parser_args():
                         default='ckpt/merg-total_ckpt/20260224_130904/30000_30ep')
     parser.add_argument('--ckpt_aud', type=str,
                         default='ckpt/pretrained_ckpt/styletts2_ckpt/decoders')
-    # encoder checkpoint dir (same directory as decoder by default – the .pth
-    # contains both encoder and decoder weights)
-    parser.add_argument('--ckpt_aud_enc', type=str, default=None,
-                        help='StyleTTS2 encoder ckpt dir; defaults to --ckpt_aud')
+    # Number of tokens to resample C_s to before feeding the TTS decoder.
+    # CS outputs a fixed 15 tokens; resampling to a larger value gives longer
+    # audio proportional to n_tokens (50 tokens ≈ ~2-3 s for short responses).
+    # No gold response is needed — set higher for longer expected responses.
+    parser.add_argument('--n_tokens', type=int, default=50,
+                        help='Target C_s token count fed to decoder (determines audio length)')
     parser.add_argument('--out_dir', type=str, default='output')
     parser.add_argument('--mode', type=str, default='train') #train #test
     # parser.add_argument('--audio_path', type=str, default="/mnt/SSD_raid1/AvaMERG/audio_v5_0") # navi
@@ -129,12 +131,6 @@ def main(args):
 
     sty = StyleTTS2Decoders(args.ckpt_aud, device=device).eval()
 
-    # Load the text-content encoder so we can align C_s to the correct token
-    # length at inference time (same alignment used during training).
-    ckpt_enc_dir = args.ckpt_aud_enc if args.ckpt_aud_enc else args.ckpt_aud
-    sty_enc = StyleTTS2Encoders(ckpt_enc_dir, device=device)
-    sty_enc.eval()
-
     pbar = tqdm(
         train_iter,
         desc=f"iter",
@@ -155,20 +151,21 @@ def main(args):
         # C_s: (B, 512, 15)  S_s: (B, 128)
 
         # ------------------------------------------------------------------
-        # Align C_s to the gold token length before feeding the decoder.
+        # Resample C_s to --n_tokens length before feeding the decoder.
         #
-        # During training (train_stage4_elice.py) the loss is computed on
-        # C_s that has been upsampled to match C_s_gold (e.g. 15 → 21 tokens)
-        # via align_cs_to_gold / F.adaptive_avg_pool1d.  Without this step at
-        # inference time the decoder sees only 15 tokens and produces ~0.7 s
-        # of audio regardless of the actual response length.
+        # CS always outputs a fixed 15 tokens (T_text in q_s_c).  The TTS
+        # prosody predictor assigns a duration to each token and generates
+        # that many frames, so 15 tokens → ~0.7 s of audio.
+        #
+        # During training, C_s was aligned to the gold phoneme count
+        # (typically 15-25 tokens) via adaptive_avg_pool1d before loss was
+        # computed.  At inference time no gold response is needed: we simply
+        # resample to --n_tokens (default 50) so the decoder produces enough
+        # frames for a full empathetic response (~2-3 s).  Increase
+        # --n_tokens for longer expected responses.
         # ------------------------------------------------------------------
-        responses = [conv.get('response', '') for conv in batch['conversations']]
-        with torch.no_grad():
-            C_s_gold = sty_enc.text_content(responses)  # (B, 512, T_gold) – already on device
-        T_gold = C_s_gold.shape[-1]
-        if C_s.shape[-1] != T_gold:
-            C_s = F.adaptive_avg_pool1d(C_s, output_size=T_gold)  # (B, 512, T_gold)
+        if C_s.shape[-1] != args.n_tokens:
+            C_s = F.adaptive_avg_pool1d(C_s, output_size=args.n_tokens)
 
         # ------------------ TTS ------------------
         wav = sty(C_s, S_s)
