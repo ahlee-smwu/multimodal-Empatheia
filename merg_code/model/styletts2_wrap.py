@@ -290,10 +290,7 @@ class StyleTTS2Encoders(nn.Module):
             if mel.size(-1) < 10 or mel.size(-2) < 10:
                 B = mel.size(0)
                 device = mel.device
-                return (
-                    torch.zeros(B, 128, device=device),
-                    torch.zeros(B, 128, device=device),
-                )
+                return torch.zeros(B, 128, device=device)
 
             # -----------------------------
             # 3) 실제 forward
@@ -311,10 +308,7 @@ class StyleTTS2Encoders(nn.Module):
             else:
                 B = 1
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            return (
-                torch.zeros(B, 128, device=device),
-                torch.zeros(B, 128, device=device),
-            )
+            return torch.zeros(B, 128, device=device)
 
 class StyleTTS2Decoders(nn.Module):
     def __init__(self, ckpt_path, device="cuda"):

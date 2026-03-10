@@ -20,6 +20,7 @@ from model.cs_sd import ContentSynchronizer, StyleDisentangler
 from model.styletts2_wrap import StyleTTS2Decoders
 import glob
 import torch.distributed as dist
+import torch.nn.functional as F
 
 logging.getLogger().setLevel(logging.ERROR)
 
@@ -34,6 +35,14 @@ def parser_args():
                         default='ckpt/merg-total_ckpt/20260224_130904/30000_30ep')
     parser.add_argument('--ckpt_aud', type=str,
                         default='ckpt/pretrained_ckpt/styletts2_ckpt/decoders')
+    # Number of tokens to resample C_s to before feeding the TTS decoder.
+    # CS always outputs a fixed 15 tokens.  During training the gold response
+    # C_s_gold was typically (B, 512, ~21) tokens, and C_s was aligned to that
+    # via F.adaptive_avg_pool1d before the CCL loss.  Using the same range at
+    # inference time (default 20) keeps the decoder in-distribution.
+    # Increase for longer expected responses (each token ≈ 50–80 ms of audio).
+    parser.add_argument('--n_tokens', type=int, default=20,
+                        help='Target C_s token count fed to decoder (determines audio length)')
     parser.add_argument('--out_dir', type=str, default='output')
     parser.add_argument('--mode', type=str, default='train') #train #test
     # parser.add_argument('--audio_path', type=str, default="/mnt/SSD_raid1/AvaMERG/audio_v5_0") # navi
@@ -141,8 +150,21 @@ def main(args):
         # ------------------ CS / SD ------------------
         C_s, _, _ = cs(hs)
         S_s, _, _, _ = sd(hs, hs)
-        # print(f"C_s: {C_s.shape}, S_s: {S_s.shape}")
-        # C_s: torch.Size([1, 512, 15]), S_s: torch.Size([1, 128])
+        # C_s: (B, 512, 15)  S_s: (B, 128)
+
+        # ------------------------------------------------------------------
+        # Resample C_s to --n_tokens length before feeding the decoder.
+        #
+        # CS always outputs a fixed 15 tokens (T_text in q_s_c).
+        # During training (train_stage4_elice.py), C_s was aligned to the
+        # gold phoneme count (~21 tokens, observed as (B,512,21) in practice)
+        # via align_cs_to_gold / F.adaptive_avg_pool1d before CCL loss.
+        # At inference time no gold response exists: we resample to --n_tokens
+        # (default 20) to stay in the training distribution.
+        # Increase --n_tokens for longer expected responses.
+        # ------------------------------------------------------------------
+        if C_s.shape[-1] != args.n_tokens:
+            C_s = F.adaptive_avg_pool1d(C_s, output_size=args.n_tokens)
 
         # ------------------ TTS ------------------
         wav = sty(C_s, S_s)
