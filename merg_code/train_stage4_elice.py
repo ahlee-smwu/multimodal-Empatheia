@@ -66,7 +66,7 @@ def parser_args():
 #     deepspeed.init_distributed(dist_backend='nccl')
 
 def initialize_distributed(args):
-    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    local_rank = int(os.getenv("LOCAL_RANK", "1"))
     torch.cuda.set_device(local_rank)
     deepspeed.init_distributed(dist_backend="nccl")
     args.local_rank = local_rank
