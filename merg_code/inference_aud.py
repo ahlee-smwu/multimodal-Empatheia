@@ -17,9 +17,10 @@ from model import load_model
 from config import load_config
 from config.cs_common import load_cs_config
 from model.cs_sd import ContentSynchronizer, StyleDisentangler
-from model.styletts2_wrap import StyleTTS2Decoders
+from model.styletts2_wrap import StyleTTS2Decoders, StyleTTS2Encoders
 import glob
 import torch.distributed as dist
+import torch.nn.functional as F
 
 logging.getLogger().setLevel(logging.ERROR)
 
@@ -34,6 +35,10 @@ def parser_args():
                         default='ckpt/merg-total_ckpt/20260224_130904/30000_30ep')
     parser.add_argument('--ckpt_aud', type=str,
                         default='ckpt/pretrained_ckpt/styletts2_ckpt/decoders')
+    # encoder checkpoint dir (same directory as decoder by default – the .pth
+    # contains both encoder and decoder weights)
+    parser.add_argument('--ckpt_aud_enc', type=str, default=None,
+                        help='StyleTTS2 encoder ckpt dir; defaults to --ckpt_aud')
     parser.add_argument('--out_dir', type=str, default='output')
     parser.add_argument('--mode', type=str, default='train') #train #test
     # parser.add_argument('--audio_path', type=str, default="/mnt/SSD_raid1/AvaMERG/audio_v5_0") # navi
@@ -124,6 +129,12 @@ def main(args):
 
     sty = StyleTTS2Decoders(args.ckpt_aud, device=device).eval()
 
+    # Load the text-content encoder so we can align C_s to the correct token
+    # length at inference time (same alignment used during training).
+    ckpt_enc_dir = args.ckpt_aud_enc if args.ckpt_aud_enc else args.ckpt_aud
+    sty_enc = StyleTTS2Encoders(ckpt_enc_dir, device=device)
+    sty_enc.eval()
+
     pbar = tqdm(
         train_iter,
         desc=f"iter",
@@ -141,8 +152,23 @@ def main(args):
         # ------------------ CS / SD ------------------
         C_s, _, _ = cs(hs)
         S_s, _, _, _ = sd(hs, hs)
-        # print(f"C_s: {C_s.shape}, S_s: {S_s.shape}")
-        # C_s: torch.Size([1, 512, 15]), S_s: torch.Size([1, 128])
+        # C_s: (B, 512, 15)  S_s: (B, 128)
+
+        # ------------------------------------------------------------------
+        # Align C_s to the gold token length before feeding the decoder.
+        #
+        # During training (train_stage4_elice.py) the loss is computed on
+        # C_s that has been upsampled to match C_s_gold (e.g. 15 → 21 tokens)
+        # via align_cs_to_gold / F.adaptive_avg_pool1d.  Without this step at
+        # inference time the decoder sees only 15 tokens and produces ~0.7 s
+        # of audio regardless of the actual response length.
+        # ------------------------------------------------------------------
+        responses = [conv.get('response', '') for conv in batch['conversations']]
+        with torch.no_grad():
+            C_s_gold = sty_enc.text_content(responses)  # (B, 512, T_gold) – already on device
+        T_gold = C_s_gold.shape[-1]
+        if C_s.shape[-1] != T_gold:
+            C_s = F.adaptive_avg_pool1d(C_s, output_size=T_gold)  # (B, 512, T_gold)
 
         # ------------------ TTS ------------------
         wav = sty(C_s, S_s)

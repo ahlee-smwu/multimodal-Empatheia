@@ -253,7 +253,7 @@ def main(args):
             return x.to(device).view(-1).long()
         if isinstance(x, list):
             return torch.tensor(x, device=device, dtype=torch.long).view(-1)
-        return torch.tensor([x], device=device, dtype=torch.long())
+        return torch.tensor([x], device=device, dtype=torch.long)
 
     for epoch in range(args.epochs):
         pbar = tqdm(
