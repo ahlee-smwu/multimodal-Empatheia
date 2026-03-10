@@ -36,10 +36,12 @@ def parser_args():
     parser.add_argument('--ckpt_aud', type=str,
                         default='ckpt/pretrained_ckpt/styletts2_ckpt/decoders')
     # Number of tokens to resample C_s to before feeding the TTS decoder.
-    # CS outputs a fixed 15 tokens; resampling to a larger value gives longer
-    # audio proportional to n_tokens (50 tokens ≈ ~2-3 s for short responses).
-    # No gold response is needed — set higher for longer expected responses.
-    parser.add_argument('--n_tokens', type=int, default=50,
+    # CS always outputs a fixed 15 tokens.  During training the gold response
+    # C_s_gold was typically (B, 512, ~21) tokens, and C_s was aligned to that
+    # via F.adaptive_avg_pool1d before the CCL loss.  Using the same range at
+    # inference time (default 20) keeps the decoder in-distribution.
+    # Increase for longer expected responses (each token ≈ 50–80 ms of audio).
+    parser.add_argument('--n_tokens', type=int, default=20,
                         help='Target C_s token count fed to decoder (determines audio length)')
     parser.add_argument('--out_dir', type=str, default='output')
     parser.add_argument('--mode', type=str, default='train') #train #test
@@ -153,16 +155,13 @@ def main(args):
         # ------------------------------------------------------------------
         # Resample C_s to --n_tokens length before feeding the decoder.
         #
-        # CS always outputs a fixed 15 tokens (T_text in q_s_c).  The TTS
-        # prosody predictor assigns a duration to each token and generates
-        # that many frames, so 15 tokens → ~0.7 s of audio.
-        #
-        # During training, C_s was aligned to the gold phoneme count
-        # (typically 15-25 tokens) via adaptive_avg_pool1d before loss was
-        # computed.  At inference time no gold response is needed: we simply
-        # resample to --n_tokens (default 50) so the decoder produces enough
-        # frames for a full empathetic response (~2-3 s).  Increase
-        # --n_tokens for longer expected responses.
+        # CS always outputs a fixed 15 tokens (T_text in q_s_c).
+        # During training (train_stage4_elice.py), C_s was aligned to the
+        # gold phoneme count (~21 tokens, observed as (B,512,21) in practice)
+        # via align_cs_to_gold / F.adaptive_avg_pool1d before CCL loss.
+        # At inference time no gold response exists: we resample to --n_tokens
+        # (default 20) to stay in the training distribution.
+        # Increase --n_tokens for longer expected responses.
         # ------------------------------------------------------------------
         if C_s.shape[-1] != args.n_tokens:
             C_s = F.adaptive_avg_pool1d(C_s, output_size=args.n_tokens)
